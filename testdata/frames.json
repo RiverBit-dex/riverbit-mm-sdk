@@ -1,0 +1,445 @@
+{
+  "description": "Golden bin-ws frames. hex is one complete binary WebSocket message (WsV2ClientFrame or WsV2ServerFrame). frame is the decoded content using the field names of proto/binws.proto; bytes fields are lowercase hex in members ending in _hex. decimal shows fixed-point members as decimal strings (value = integer / 10^decimals). Every library must decode hex to exactly this content and, where it has an encoder, encode the content back to exactly this hex.",
+  "frames": [
+    {
+      "name": "client-login",
+      "direction": "client",
+      "hex": "3a5c08bda9d0ac94341210000102030405060708090a0b0c0d0e0f1a414752b41eb2baa20a3e169891002152aa388130e129b3c8dbd4f957e03a1cddef7f1e12c690cbc3a8ec00f287739ea28e2a8d10ba6073353074735cc6fe56c23f1b",
+      "frame": {
+        "id": 0,
+        "body": "login",
+        "message": {
+          "timestamp_ms": 1792168694973,
+          "nonce_hex": "000102030405060708090a0b0c0d0e0f",
+          "signature_hex": "4752b41eb2baa20a3e169891002152aa388130e129b3c8dbd4f957e03a1cddef7f1e12c690cbc3a8ec00f287739ea28e2a8d10ba6073353074735cc6fe56c23f1b"
+        }
+      }
+    },
+    {
+      "name": "client-ping",
+      "direction": "client",
+      "hex": "3200",
+      "frame": {
+        "id": 0,
+        "body": "ping"
+      }
+    },
+    {
+      "name": "client-subscribe-l2",
+      "direction": "client",
+      "hex": "22177b2274797065223a226c32222c2263223a22425443227d",
+      "frame": {
+        "id": 0,
+        "body": "subscribe_json",
+        "json": "{\"type\":\"l2\",\"c\":\"BTC\"}"
+      }
+    },
+    {
+      "name": "client-info-open-orders",
+      "direction": "client",
+      "hex": "08071a497b2274797065223a226f70656e4f7264657273222c2275736572223a22307832323232323232323232323232323232323232323232323232323232323232323232323232323232227d",
+      "frame": {
+        "id": 7,
+        "body": "info_json",
+        "json": "{\"type\":\"openOrders\",\"user\":\"0x2222222222222222222222222222222222222222\"}"
+      }
+    },
+    {
+      "name": "server-login-ok",
+      "direction": "server",
+      "hex": "422e0801121422222222222222222222222222222222222222221a141a642f0e3c3af545e7acbd38b07251b3990914f1",
+      "frame": {
+        "id": 0,
+        "body": "login",
+        "message": {
+          "ok": true,
+          "user_hex": "2222222222222222222222222222222222222222",
+          "signer_hex": "1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "error": ""
+        }
+      }
+    },
+    {
+      "name": "server-login-rejected",
+      "direction": "server",
+      "hex": "420f220d626164207369676e6174757265",
+      "frame": {
+        "id": 0,
+        "body": "login",
+        "message": {
+          "ok": false,
+          "user_hex": "",
+          "signer_hex": "",
+          "error": "bad signature"
+        }
+      }
+    },
+    {
+      "name": "server-l2-snapshot",
+      "direction": "server",
+      "hex": "22410a3f0a0342544310d8a9d0ac9434180120052a0985ea3080ea30f6e9303209f09309c09a0cd086033a0301020142068aea3094ea304a06a08d06e0a71252020103",
+      "frame": {
+        "id": 0,
+        "body": "l2_delta.snapshot",
+        "message": {
+          "coin": "BTC",
+          "time": 1792168695000,
+          "px_decimals": 1,
+          "sz_decimals": 5,
+          "bid_px": [
+            800005,
+            800000,
+            799990
+          ],
+          "bid_sz": [
+            150000,
+            200000,
+            50000
+          ],
+          "bid_n": [
+            1,
+            2,
+            1
+          ],
+          "ask_px": [
+            800010,
+            800020
+          ],
+          "ask_sz": [
+            100000,
+            300000
+          ],
+          "ask_n": [
+            1,
+            3
+          ]
+        },
+        "decimal": {
+          "bid_px": [
+            "80000.5",
+            "80000.0",
+            "79999.0"
+          ],
+          "bid_sz": [
+            "1.50000",
+            "2.00000",
+            "0.50000"
+          ],
+          "ask_px": [
+            "80001.0",
+            "80002.0"
+          ],
+          "ask_sz": [
+            "1.00000",
+            "3.00000"
+          ]
+        }
+      },
+      "book_after": {
+        "bids": [
+          {
+            "px": "80000.5",
+            "sz": "1.50000"
+          },
+          {
+            "px": "80000.0",
+            "sz": "2.00000"
+          },
+          {
+            "px": "79999.0",
+            "sz": "0.50000"
+          }
+        ],
+        "asks": [
+          {
+            "px": "80001.0",
+            "sz": "1.00000"
+          },
+          {
+            "px": "80002.0",
+            "sz": "3.00000"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-l2-update",
+      "direction": "server",
+      "hex": "223412320a0342544310bcaad0ac9434180120052a0680ea3083ea30320690a10ff8c9043a038fea304203a09c014a01025201015805",
+      "applies_to": "server-l2-snapshot",
+      "frame": {
+        "id": 0,
+        "body": "l2_delta.update",
+        "message": {
+          "coin": "BTC",
+          "time": 1792168695100,
+          "px_decimals": 1,
+          "sz_decimals": 5,
+          "bid_px": [
+            800000,
+            800003
+          ],
+          "bid_sz": [
+            250000,
+            75000
+          ],
+          "ask_px": [
+            800015
+          ],
+          "ask_sz": [
+            20000
+          ],
+          "bid_removed": [
+            2
+          ],
+          "ask_removed": [
+            1
+          ],
+          "spread": 5
+        },
+        "decimal": {
+          "bid_px": [
+            "80000.0",
+            "80000.3"
+          ],
+          "bid_sz": [
+            "2.50000",
+            "0.75000"
+          ],
+          "ask_px": [
+            "80001.5"
+          ],
+          "ask_sz": [
+            "0.20000"
+          ],
+          "spread": "0.5"
+        }
+      },
+      "book_after": {
+        "bids": [
+          {
+            "px": "80000.5",
+            "sz": "1.50000"
+          },
+          {
+            "px": "80000.3",
+            "sz": "0.75000"
+          },
+          {
+            "px": "80000.0",
+            "sz": "2.50000"
+          }
+        ],
+        "asks": [
+          {
+            "px": "80001.0",
+            "sz": "1.00000"
+          },
+          {
+            "px": "80001.5",
+            "sz": "0.20000"
+          }
+        ]
+      }
+    },
+    {
+      "name": "server-l2book",
+      "direction": "server",
+      "hex": "1a310a0342544310a0abd0ac9434180120052a0680ea30f6e9303206c09a0cd086033a02020142038aea304a03a08d06520101",
+      "frame": {
+        "id": 0,
+        "body": "l2_book",
+        "message": {
+          "coin": "BTC",
+          "time": 1792168695200,
+          "px_decimals": 1,
+          "sz_decimals": 5,
+          "bid_px": [
+            800000,
+            799990
+          ],
+          "bid_sz": [
+            200000,
+            50000
+          ],
+          "bid_n": [
+            2,
+            1
+          ],
+          "ask_px": [
+            800010
+          ],
+          "ask_sz": [
+            100000
+          ],
+          "ask_n": [
+            1
+          ]
+        },
+        "decimal": {
+          "bid_px": [
+            "80000.0",
+            "79999.0"
+          ],
+          "bid_sz": [
+            "2.00000",
+            "0.50000"
+          ],
+          "ask_px": [
+            "80001.0"
+          ],
+          "ask_sz": [
+            "1.00000"
+          ]
+        }
+      }
+    },
+    {
+      "name": "server-bbo",
+      "direction": "server",
+      "hex": "2a240a034254431084acd0ac9434180120052880ea3030c09a0c408aea3048a08d0638025001",
+      "frame": {
+        "id": 0,
+        "body": "bbo",
+        "message": {
+          "coin": "BTC",
+          "time": 1792168695300,
+          "px_decimals": 1,
+          "sz_decimals": 5,
+          "bid_px": 800000,
+          "bid_sz": 200000,
+          "bid_n": 2,
+          "ask_px": 800010,
+          "ask_sz": 100000,
+          "ask_n": 1
+        },
+        "decimal": {
+          "bid_px": "80000.0",
+          "bid_sz": "2.00000",
+          "ask_px": "80001.0",
+          "ask_sz": "1.00000"
+        }
+      }
+    },
+    {
+      "name": "server-bbo-no-ask",
+      "direction": "server",
+      "hex": "2a1a0a0342544310e8acd0ac9434180120052880ea3030c09a0c3802",
+      "frame": {
+        "id": 0,
+        "body": "bbo",
+        "message": {
+          "coin": "BTC",
+          "time": 1792168695400,
+          "px_decimals": 1,
+          "sz_decimals": 5,
+          "bid_px": 800000,
+          "bid_sz": 200000,
+          "bid_n": 2
+        },
+        "decimal": {
+          "bid_px": "80000.0",
+          "bid_sz": "2.00000"
+        }
+      }
+    },
+    {
+      "name": "server-trades",
+      "direction": "server",
+      "hex": "3acd010a034254431001180522610801108aea3018e05d20ccadd0ac943428a9463220abababababababababababababababababababababababababababababababab3a14333333333333333333333333333333333333333342144444444444444444444444444444444444444444225f1080ea3018882720b0aed0ac943428aa463220abababababababababababababababababababababababababababababababab3a14444444444444444444444444444444444444444442143333333333333333333333333333333333333333",
+      "frame": {
+        "id": 0,
+        "body": "trades",
+        "message": {
+          "coin": "BTC",
+          "px_decimals": 1,
+          "sz_decimals": 5,
+          "trades": [
+            {
+              "buy": true,
+              "px": 800010,
+              "sz": 12000,
+              "time": 1792168695500,
+              "tid": 9001,
+              "hash_hex": "abababababababababababababababababababababababababababababababab",
+              "buyer_hex": "3333333333333333333333333333333333333333",
+              "seller_hex": "4444444444444444444444444444444444444444"
+            },
+            {
+              "buy": false,
+              "px": 800000,
+              "sz": 5000,
+              "time": 1792168695600,
+              "tid": 9002,
+              "hash_hex": "abababababababababababababababababababababababababababababababab",
+              "buyer_hex": "4444444444444444444444444444444444444444",
+              "seller_hex": "3333333333333333333333333333333333333333"
+            }
+          ]
+        },
+        "decimal": {
+          "trades": [
+            {
+              "px": "80001.0",
+              "sz": "0.12000"
+            },
+            {
+              "px": "80000.0",
+              "sz": "0.05000"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "server-candle",
+      "direction": "server",
+      "hex": "32310a034254431202316d18c0b4cfac9434209f89d3ac9434280130053880ea30408aea3048b2ea3050cee93058a887156011",
+      "frame": {
+        "id": 0,
+        "body": "candle",
+        "message": {
+          "coin": "BTC",
+          "interval": "1m",
+          "open_time": 1792168680000,
+          "close_time": 1792168739999,
+          "px_decimals": 1,
+          "sz_decimals": 5,
+          "open": 800000,
+          "close": 800010,
+          "high": 800050,
+          "low": 799950,
+          "volume": 345000,
+          "trade_count": 17
+        },
+        "decimal": {
+          "open": "80000.0",
+          "close": "80001.0",
+          "high": "80005.0",
+          "low": "79995.0",
+          "volume": "3.45000"
+        }
+      }
+    },
+    {
+      "name": "server-json-pong",
+      "direction": "server",
+      "hex": "12127b226368616e6e656c223a22706f6e67227d",
+      "frame": {
+        "id": 0,
+        "body": "json",
+        "json": "{\"channel\":\"pong\"}"
+      }
+    },
+    {
+      "name": "server-json-post-reply",
+      "direction": "server",
+      "hex": "080712677b226368616e6e656c223a22706f7374222c2264617461223a7b226964223a372c22726573706f6e7365223a7b2274797065223a22696e666f222c227061796c6f6164223a7b2274797065223a226f70656e4f7264657273222c2264617461223a5b5d7d7d7d7d",
+      "frame": {
+        "id": 7,
+        "body": "json",
+        "json": "{\"channel\":\"post\",\"data\":{\"id\":7,\"response\":{\"type\":\"info\",\"payload\":{\"type\":\"openOrders\",\"data\":[]}}}}"
+      }
+    }
+  ]
+}
