@@ -6,11 +6,13 @@ Client libraries for market makers integrating with the RiverBit exchange API: m
 
 ## Languages
 
-| Language | Directory | Status |
+| Language | Directory | Durable pending-request journal |
 |---|---|---|
-| Go | [`go/`](go/) | In development |
-| Python | [`python/`](python/) | In development |
-| Rust | [`rust/`](rust/) | In development |
+| Go | [`go/`](go/) | Yes |
+| Python | [`python/`](python/) | Not yet |
+| Rust | [`rust/`](rust/) | Not yet |
+
+Each library covers signing, order entry, cancellation, modification, REST queries, bin-ws market data and order events, a local order book and reconciliation helpers. The Go library also persists pending requests to disk and recovers them after a restart; with Python and Rust, persist the signed request yourself before sending it.
 
 All three implementations follow the same protocol guide, share one Protobuf definition and must reproduce the same golden signing vectors byte for byte.
 

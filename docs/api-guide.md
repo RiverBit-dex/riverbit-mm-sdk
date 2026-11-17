@@ -180,7 +180,7 @@ These recommendations cover request lifecycle, durable recovery, snapshot checks
 
 One action may create many orders; an order may subsequently have modify and cancel requests. Request completion and order termination are different states. A `filled` receipt leg can leave a resting remainder. Use current `order.status` and remaining `sz` for live state, and fill records for executed price and size. Do not wait for `open` when an order has already filled.
 
-Coordinate nonce allocation across every process using a signer. Prefer one serial execution owner per trading account/market so event handlers, periodic refresh and recovery cannot duplicate mutations. The demo's shared `STATE_DIR` and local file locks are not a multi-host coordinator.
+Coordinate nonce allocation across every process using a signer. Prefer one serial execution owner per trading account/market so event handlers, periodic refresh and recovery cannot duplicate mutations. A state directory shared through local file locks (as the Go library's pending journal uses) is not a multi-host coordinator.
 
 ### 11.2 Place, cancel, modify and refill
 
@@ -194,7 +194,7 @@ Coordinate nonce allocation across every process using a signer. Prefer one seri
 | Partial batch failure | Record successes and rejections separately; construct subsequent actions only for newly evaluated gaps. Never replay successful legs. |
 | Unknown result | Retain the journal and already observed per-leg evidence. `unknownOid`, an empty book, elapsed time and a consumed nonce do not prove nonexecution. |
 
-Give risk cancellation priority over placement and reserve independent API capacity for cancellation and recovery. A per-side fixed cooldown can start when a remaining-size decrease or disappearance is first confirmed; subsequent notifications should not keep extending its deadline. At expiry, reread inventory, funds and prices. Disappearance indicates a depth gap, not necessarily a fill. Your strategy supplies cooldown, maximum order age and repricing thresholds; the demo has no strategy defaults.
+Give risk cancellation priority over placement and reserve independent API capacity for cancellation and recovery. A per-side fixed cooldown can start when a remaining-size decrease or disappearance is first confirmed; subsequent notifications should not keep extending its deadline. At expiry, reread inventory, funds and prices. Disappearance indicates a depth gap, not necessarily a fill. Your strategy supplies cooldown, maximum order age and repricing thresholds; the SDK has no strategy defaults.
 
 ### 11.3 Snapshots, events and exposure
 
@@ -225,9 +225,9 @@ An explicit rejection without potentially effective results can end that request
 
 ### 11.5 Restart, shutdown and monitoring
 
-On restart, verify original signer, account, endpoint, network and durable directory, recover unknown requests, then rebuild orders and risk state. Changing WS/REST, account or instance must not bypass pending. The demo's `recover` only queries and never replays `ACTION_FILE`.
+On restart, verify original signer, account, endpoint, network and durable directory, recover unknown requests, then rebuild orders and risk state. Changing WS/REST, account or instance must not bypass pending. Recovery only queries; it never replays an action.
 
-A continuous maker should stop new quotes, retain unknown requests, cancel known orders in its own management scope and verify outcomes before reporting cleanup complete. Exiting a process or closing WS does not cancel orders. This demo does not implement automatic cancellation on strategy shutdown; orders left by `trade` need explicit cancellation. Report incomplete cleanup if cancellation or queries fail; successful process exit is not zero account exposure.
+A continuous maker should stop new quotes, retain unknown requests, cancel known orders in its own management scope and verify outcomes before reporting cleanup complete. Exiting a process or closing WS does not cancel orders. The SDK does not cancel orders automatically on shutdown; orders you leave open need explicit cancellation. Report incomplete cleanup if cancellation or queries fail; successful process exit is not zero account exposure.
 
 Monitor pending count/age, market/account data age, per-leg rejection reasons, rate limits, disconnects, remaining depth, inventory and unconfirmed risk-cancellation age. Measure submission → observed execution and observed execution → current visibility separately. Report unresolved requests and quoting downtime alongside successful-request latency so stalled work is visible.
 
