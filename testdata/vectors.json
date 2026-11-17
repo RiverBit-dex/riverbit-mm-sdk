@@ -13,6 +13,14 @@
       "nonce_hex": "000102030405060708090a0b0c0d0e0f",
       "message": "riverbit-ws-v2-login\nhost:pre-api.riverbit.io\ntimestamp:1792168694973\nnonce:000102030405060708090a0b0c0d0e0f",
       "signature_hex": "4752b41eb2baa20a3e169891002152aa388130e129b3c8dbd4f957e03a1cddef7f1e12c690cbc3a8ec00f287739ea28e2a8d10ba6073353074735cc6fe56c23f1b"
+    },
+    {
+      "name": "login-other-host",
+      "host": "api.example.com",
+      "timestamp_ms": 1792168700000,
+      "nonce_hex": "ffeeddccbbaa99887766554433221100",
+      "message": "riverbit-ws-v2-login\nhost:api.example.com\ntimestamp:1792168700000\nnonce:ffeeddccbbaa99887766554433221100",
+      "signature_hex": "9aa27a824d56d451b255902f3f27c838e3596013c0907adf3e0dcf67c1e234925e1d3eeaf26d72388d24d1e3643bf7fc2b0489046db20f762cecf1e5df28a65d1b"
     }
   ],
   "actions": [
@@ -45,6 +53,182 @@
       "signature": {
         "r": "0xc69888725b054488375d419e27dea48f41f2f8da5ec863adf9af1e1d31f1c071",
         "s": "0x1adb693fdc1e45c68f4c39f4f868f731bcaaa11eb159fb2a5d46ebe8843aff24",
+        "v": 28
+      }
+    },
+    {
+      "name": "order-cloid-no-vault",
+      "chain_id": 12589,
+      "source": "b",
+      "nonce": 1792168694973,
+      "vault_address": null,
+      "action_json": "{\"type\":\"order\",\"orders\":[{\"a\":1,\"b\":true,\"p\":\"80000\",\"s\":\"0.001\",\"r\":false,\"t\":{\"limit\":{\"tif\":\"Alo\"}},\"c\":\"0x00000000000000000000000000000001\"}],\"grouping\":\"na\"}",
+      "msgpack_hex": "83a474797065a56f72646572a66f72646572739187a16101a162c3a170a53830303030a173a5302e303031a172c2a17481a56c696d697481a3746966a3416c6fa163d92230783030303030303030303030303030303030303030303030303030303030303031a867726f7570696e67a26e61",
+      "connection_id": "0xb9ad1853aacab62a7758c02a9fd2db9e294eaa4d6dd3d24db1d4288ca31c2a20",
+      "digest": "0xa569491000734a634c279d91768e85ff759273c526b439a48ab2a35537bf32a5",
+      "signature": {
+        "r": "0xedf4230b95de2814742b82691662b161d5dda8d707de3fac3156f1a999476e6d",
+        "s": "0x7fed5aab0e5ffd16c9404b132d6df5381c767c71c052914c55549b8dc1c9dc4c",
+        "v": 28
+      }
+    },
+    {
+      "name": "order-two-leg-no-vault",
+      "chain_id": 12589,
+      "source": "b",
+      "nonce": 1792168694973,
+      "vault_address": null,
+      "action_json": "{\"type\":\"order\",\"orders\":[{\"a\":1,\"b\":true,\"p\":\"80000\",\"s\":\"0.001\",\"r\":false,\"t\":{\"limit\":{\"tif\":\"Alo\"}},\"c\":\"0x00000000000000000000000000000001\"},{\"a\":1,\"b\":false,\"p\":\"82000\",\"s\":\"0.001\",\"r\":false,\"t\":{\"limit\":{\"tif\":\"Alo\"}},\"c\":\"0x00000000000000000000000000000002\"}],\"grouping\":\"na\"}",
+      "msgpack_hex": "83a474797065a56f72646572a66f72646572739287a16101a162c3a170a53830303030a173a5302e303031a172c2a17481a56c696d697481a3746966a3416c6fa163d9223078303030303030303030303030303030303030303030303030303030303030303187a16101a162c2a170a53832303030a173a5302e303031a172c2a17481a56c696d697481a3746966a3416c6fa163d92230783030303030303030303030303030303030303030303030303030303030303032a867726f7570696e67a26e61",
+      "connection_id": "0x1dd29224425f698653ff1d16213427fa8fa0aa672d2594758262705e088ba8e9",
+      "digest": "0x73f3a7b3a67808d64bdd2cf9404becc0961c55aebeb546be57e79c86812fd87e",
+      "signature": {
+        "r": "0xaae82d63be0ac41b98ac9170835a5926b9581b852c76d217ac800630465b51b7",
+        "s": "0x07c7aeda581ec1d946a12b30881b968f16e07ecea00a6bb8e826386767e83fa1",
+        "v": 28
+      }
+    },
+    {
+      "name": "order-two-leg-vault",
+      "chain_id": 12589,
+      "source": "b",
+      "nonce": 1792168694973,
+      "vault_address": "0x1111111111111111111111111111111111111111",
+      "action_json": "{\"type\":\"order\",\"orders\":[{\"a\":1,\"b\":true,\"p\":\"80000\",\"s\":\"0.001\",\"r\":false,\"t\":{\"limit\":{\"tif\":\"Alo\"}},\"c\":\"0x00000000000000000000000000000001\"},{\"a\":1,\"b\":false,\"p\":\"82000\",\"s\":\"0.001\",\"r\":false,\"t\":{\"limit\":{\"tif\":\"Alo\"}},\"c\":\"0x00000000000000000000000000000002\"}],\"grouping\":\"na\"}",
+      "msgpack_hex": "83a474797065a56f72646572a66f72646572739287a16101a162c3a170a53830303030a173a5302e303031a172c2a17481a56c696d697481a3746966a3416c6fa163d9223078303030303030303030303030303030303030303030303030303030303030303187a16101a162c2a170a53832303030a173a5302e303031a172c2a17481a56c696d697481a3746966a3416c6fa163d92230783030303030303030303030303030303030303030303030303030303030303032a867726f7570696e67a26e61",
+      "connection_id": "0x44d9261b8ee6479c1d86858bc2d8606e02c75b1e9fdf101d803b8e97b5d9b3e0",
+      "digest": "0xc46fe5ed0144800e91e26901c80b519070ce3ba073faf6a425e39e3c4305dbbb",
+      "signature": {
+        "r": "0x8b720c36c3bc6d3d0fa4035be595b85ae7d76f31cdcdb38bfc517ed25b8d583b",
+        "s": "0x1846919a427b4da9b66a31bfa3a4c17e38fce80cfad0cf14caacebb10a58e91f",
+        "v": 27
+      }
+    },
+    {
+      "name": "order-gtc-reduce-only-no-vault",
+      "chain_id": 12589,
+      "source": "b",
+      "nonce": 1792168694973,
+      "vault_address": null,
+      "action_json": "{\"type\":\"order\",\"orders\":[{\"a\":2,\"b\":false,\"p\":\"3500.5\",\"s\":\"0.25\",\"r\":true,\"t\":{\"limit\":{\"tif\":\"Gtc\"}}}],\"grouping\":\"na\"}",
+      "msgpack_hex": "83a474797065a56f72646572a66f72646572739186a16102a162c2a170a6333530302e35a173a4302e3235a172c3a17481a56c696d697481a3746966a3477463a867726f7570696e67a26e61",
+      "connection_id": "0x1058cc5ec0e953a951344b5473976ce8d622cf0c340543b6634a0ee7b5891f39",
+      "digest": "0x27c5eaaae5372e53307f604a76120a318e2fc1e4a82f67dbd9b96a2d846ac4a6",
+      "signature": {
+        "r": "0x0a2f3d5e63c9daa810a826d5892a31317338e5ea2ccfbc142485d544f2a3d4c7",
+        "s": "0x00cfdb4daba2be8a14a828a70dc9f71dc61087594bb40871b9386bdf6f6cd506",
+        "v": 27
+      }
+    },
+    {
+      "name": "cancel-no-vault",
+      "chain_id": 12589,
+      "source": "b",
+      "nonce": 1792168694973,
+      "vault_address": null,
+      "action_json": "{\"type\":\"cancel\",\"cancels\":[{\"a\":1,\"o\":123456789}]}",
+      "msgpack_hex": "82a474797065a663616e63656ca763616e63656c739182a16101a16fce075bcd15",
+      "connection_id": "0xb92cbbe8b03613fac9d0cac3ddc26024897970776388742f302633cf603aa130",
+      "digest": "0x3c8f9eacde7f4fc7946e471b1b64e8af8d2c875cce391a6282338e08140c857a",
+      "signature": {
+        "r": "0x13d1c1a3ab0a398e44a55b09a5695dfa2133640652b766655ee4c27e5722d190",
+        "s": "0x060cb81d6f99cb979caf5e769eb821532001005c369c264f53b8e00c643481a5",
+        "v": 28
+      }
+    },
+    {
+      "name": "cancel-vault",
+      "chain_id": 12589,
+      "source": "b",
+      "nonce": 1792168694973,
+      "vault_address": "0x1111111111111111111111111111111111111111",
+      "action_json": "{\"type\":\"cancel\",\"cancels\":[{\"a\":1,\"o\":123456789},{\"a\":1,\"o\":123456790}]}",
+      "msgpack_hex": "82a474797065a663616e63656ca763616e63656c739282a16101a16fce075bcd1582a16101a16fce075bcd16",
+      "connection_id": "0xa5fa53b224a589bef6d7d88d41ff8092501c318ef67b86b8297535022c67033d",
+      "digest": "0xf5bd666c9929518acf103eef133182774845d285f12b89129fec7d1f55cf0f7d",
+      "signature": {
+        "r": "0x76e22da06fd86f2ec2074eb691fe7f75dc0cbc98ba3eaf6402be92ec3c5e0b47",
+        "s": "0x73fb97c2bbb39d35e657323c0847156552294f5fdb6717c2998d34cadbf72874",
+        "v": 27
+      }
+    },
+    {
+      "name": "cancel-by-cloid-no-vault",
+      "chain_id": 12589,
+      "source": "b",
+      "nonce": 1792168694973,
+      "vault_address": null,
+      "action_json": "{\"type\":\"cancelByCloid\",\"cancels\":[{\"asset\":1,\"cloid\":\"0x00000000000000000000000000000001\"}]}",
+      "msgpack_hex": "82a474797065ad63616e63656c4279436c6f6964a763616e63656c739182a5617373657401a5636c6f6964d92230783030303030303030303030303030303030303030303030303030303030303031",
+      "connection_id": "0xfdeb5a0dd391ef8af049fbc8d1c54236cffc5c62419c9667ca456035255dd775",
+      "digest": "0xe1ee81aa7d7c8be6054a196f53f47ab3f9369d4523ed840f489f062c783024fb",
+      "signature": {
+        "r": "0x86644c4c7a55ca650b8630580709b0abef174304904d5a73d8bf0ca64cf5eb21",
+        "s": "0x59b665024344fee04284b7cc522ee67157fffb385fc8fcfecb198acd0e7a0aa4",
+        "v": 28
+      }
+    },
+    {
+      "name": "cancel-by-cloid-vault",
+      "chain_id": 12589,
+      "source": "b",
+      "nonce": 1792168694973,
+      "vault_address": "0x1111111111111111111111111111111111111111",
+      "action_json": "{\"type\":\"cancelByCloid\",\"cancels\":[{\"asset\":1,\"cloid\":\"0x00000000000000000000000000000001\"}]}",
+      "msgpack_hex": "82a474797065ad63616e63656c4279436c6f6964a763616e63656c739182a5617373657401a5636c6f6964d92230783030303030303030303030303030303030303030303030303030303030303031",
+      "connection_id": "0xc8724c00e579346c87f82b75489a91c22236443fe5e26888103ff65ef722fb3f",
+      "digest": "0x072b559b64094865df882a90da626c141fa76fc6b51a742d81a6b116f84cb5aa",
+      "signature": {
+        "r": "0x60f962cd34ceb11408cfcd393fe4124b154b432c3c1f8eb50b1c22d99903e99d",
+        "s": "0x2b8bb2384b05861bb28984d80118ff72aa1caaea1864679d1116488fa770214b",
+        "v": 28
+      }
+    },
+    {
+      "name": "modify-no-vault",
+      "chain_id": 12589,
+      "source": "b",
+      "nonce": 1792168694973,
+      "vault_address": null,
+      "action_json": "{\"type\":\"modify\",\"oid\":123456789,\"order\":{\"a\":1,\"b\":true,\"p\":\"80100\",\"s\":\"0.001\",\"r\":false,\"t\":{\"limit\":{\"tif\":\"Alo\"}},\"c\":\"0x00000000000000000000000000000001\"}}",
+      "msgpack_hex": "83a474797065a66d6f64696679a36f6964ce075bcd15a56f7264657287a16101a162c3a170a53830313030a173a5302e303031a172c2a17481a56c696d697481a3746966a3416c6fa163d92230783030303030303030303030303030303030303030303030303030303030303031",
+      "connection_id": "0xec5279f66d9e4d5f94b487744ddd32dfe5cdbef25c4f79d9a199cbd5242b7304",
+      "digest": "0xd58c8b42b6b3c6d3f0168a4ddc7809fd5b0d46ece939e80d757f61d08f60573e",
+      "signature": {
+        "r": "0x20f594e0748d7fb5d459b904c6a0862f858d74f8ee5f33634f527ae776a9aba2",
+        "s": "0x245688afd0b78987d9e1ca7159ab718102425a79b6ebe6b85f4d1701cc651615",
+        "v": 27
+      }
+    },
+    {
+      "name": "batch-modify-no-vault",
+      "chain_id": 12589,
+      "source": "b",
+      "nonce": 1792168694973,
+      "vault_address": null,
+      "action_json": "{\"type\":\"batchModify\",\"modifies\":[{\"oid\":123456789,\"order\":{\"a\":1,\"b\":true,\"p\":\"80100\",\"s\":\"0.001\",\"r\":false,\"t\":{\"limit\":{\"tif\":\"Alo\"}},\"c\":\"0x00000000000000000000000000000001\"}}]}",
+      "msgpack_hex": "82a474797065ab62617463684d6f64696679a86d6f6469666965739182a36f6964ce075bcd15a56f7264657287a16101a162c3a170a53830313030a173a5302e303031a172c2a17481a56c696d697481a3746966a3416c6fa163d92230783030303030303030303030303030303030303030303030303030303030303031",
+      "connection_id": "0x185fa32c8ba9e0d655dd040feece29ae2c998ae74c7d3c12424d06ff76ab9fe1",
+      "digest": "0x01029393baffc02e7e9b0a464ff88faec15f38e24641aad5ca42822330e5eb6d",
+      "signature": {
+        "r": "0xeb7847eee9da30d560c69babbe47b8406adda6a22b6348fcf42b5340ff3b52c2",
+        "s": "0x703e381cb7f6bb1e32982a6affdf45517c5d7572e165b31e6ddfa88b93c9b019",
+        "v": 28
+      }
+    },
+    {
+      "name": "batch-modify-vault",
+      "chain_id": 12589,
+      "source": "b",
+      "nonce": 1792168694973,
+      "vault_address": "0x1111111111111111111111111111111111111111",
+      "action_json": "{\"type\":\"batchModify\",\"modifies\":[{\"oid\":123456789,\"order\":{\"a\":1,\"b\":true,\"p\":\"80100\",\"s\":\"0.001\",\"r\":false,\"t\":{\"limit\":{\"tif\":\"Alo\"}},\"c\":\"0x00000000000000000000000000000001\"}},{\"oid\":123456790,\"order\":{\"a\":1,\"b\":false,\"p\":\"81900\",\"s\":\"0.001\",\"r\":false,\"t\":{\"limit\":{\"tif\":\"Alo\"}},\"c\":\"0x00000000000000000000000000000002\"}}]}",
+      "msgpack_hex": "82a474797065ab62617463684d6f64696679a86d6f6469666965739282a36f6964ce075bcd15a56f7264657287a16101a162c3a170a53830313030a173a5302e303031a172c2a17481a56c696d697481a3746966a3416c6fa163d9223078303030303030303030303030303030303030303030303030303030303030303182a36f6964ce075bcd16a56f7264657287a16101a162c2a170a53831393030a173a5302e303031a172c2a17481a56c696d697481a3746966a3416c6fa163d92230783030303030303030303030303030303030303030303030303030303030303032",
+      "connection_id": "0x7b0a95583a697ad8df5fffca1f3b6f2f887e11dcd8647f97b0a427e88c03520e",
+      "digest": "0x1233aaa52d5f5eaad330772c2537b84a3474898b04202a35b3b1040eeabf4099",
+      "signature": {
+        "r": "0x9c4f44803e05c4d7ed57039317a3c0d03cc4a20a5b752d9fa372dcd72e118afc",
+        "s": "0x41c92b59c7ed3ed8369f991b4605370f6486d0ed5074e6d2d22e739ea915d035",
         "v": 28
       }
     }
