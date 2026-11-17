@@ -1,0 +1,138 @@
+// bin-ws frame definitions for the RiverBit binary WebSocket endpoint (/bin-ws).
+// Every binary WebSocket message is one WsV2ClientFrame or WsV2ServerFrame.
+// This file is the single source for the Go, Python and Rust codecs in this repository.
+
+syntax = "proto3";
+
+package riverbit.api.v1;
+
+message WsV2ClientFrame {
+  // Request id for post bodies (action/info); ignored otherwise.
+  uint64 id = 1;
+  oneof body {
+    // Exact signed action JSON bytes (the same body as REST POST /exchange).
+    bytes action_json = 2;
+    // Info payload JSON, for example {"type":"openOrders","user":"0x..."}.
+    bytes info_json = 3;
+    // Subscription object JSON, for example {"type":"candle","coin":"BTC","interval":"1m"}.
+    bytes subscribe_json = 4;
+    bytes unsubscribe_json = 5;
+    WsV2Ping ping = 6;
+    WsV2Login login = 7;
+  }
+}
+message WsV2Ping {}
+
+// First frame of every /bin-ws connection. EIP-191 personal_sign over
+// "riverbit-ws-v2-login\nhost:<host>\ntimestamp:<timestamp_ms>\nnonce:<hex>".
+message WsV2Login {
+  uint64 timestamp_ms = 1;
+  bytes nonce = 2;
+  // 65 bytes r || s || v.
+  bytes signature = 3;
+}
+
+// One binary WebSocket message on /bin-ws, server to client.
+message WsV2ServerFrame {
+  // Request id for frames caused by a post request; 0 for pushes and acks.
+  uint64 id = 1;
+  oneof body {
+    // A complete JSON frame, byte-identical to the JSON endpoint.
+    bytes json = 2;
+    L2BookFrame l2_book = 3;
+    L2DeltaFrame l2_delta = 4;
+    BboFrame bbo = 5;
+    CandleFrame candle = 6;
+    TradesFrame trades = 7;
+    WsV2LoginResult login = 8;
+  }
+}
+message WsV2LoginResult {
+  bool ok = 1;
+  // Resolved master account, 20 bytes.
+  bytes user = 2;
+  // Recovered signer: the API wallet or the master account itself, 20 bytes.
+  bytes signer = 3;
+  string error = 4;
+}
+
+// Fixed point: value = integer / 10^decimals, decimals shared by the frame.
+// Parallel packed arrays per side have equal length.
+message L2BookFrame {
+  string coin = 1;
+  uint64 time = 2;
+  uint32 px_decimals = 3;
+  uint32 sz_decimals = 4;
+  repeated uint64 bid_px = 5;
+  repeated uint64 bid_sz = 6;
+  repeated uint32 bid_n = 7;
+  repeated uint64 ask_px = 8;
+  repeated uint64 ask_sz = 9;
+  repeated uint32 ask_n = 10;
+}
+// Channel "l2": a snapshot, then updates against the previous book. Decimals
+// are locked per subscription by the latest snapshot; a snapshot may arrive at
+// any time and replaces the whole book.
+message L2DeltaFrame {
+  oneof kind {
+    L2BookFrame snapshot = 1;
+    L2DeltaUpdate update = 2;
+  }
+}
+message L2DeltaUpdate {
+  string coin = 1;
+  uint64 time = 2;
+  uint32 px_decimals = 3;
+  uint32 sz_decimals = 4;
+  // New or size-changed levels, in current book order.
+  repeated uint64 bid_px = 5;
+  repeated uint64 bid_sz = 6;
+  repeated uint64 ask_px = 7;
+  repeated uint64 ask_sz = 8;
+  // Removed levels as indices into the previous book; remove as one set.
+  repeated uint32 bid_removed = 9;
+  repeated uint32 ask_removed = 10;
+  optional uint64 spread = 11;
+}
+message BboFrame {
+  string coin = 1;
+  uint64 time = 2;
+  uint32 px_decimals = 3;
+  uint32 sz_decimals = 4;
+  optional uint64 bid_px = 5;
+  optional uint64 bid_sz = 6;
+  optional uint32 bid_n = 7;
+  optional uint64 ask_px = 8;
+  optional uint64 ask_sz = 9;
+  optional uint32 ask_n = 10;
+}
+message CandleFrame {
+  string coin = 1;
+  string interval = 2;
+  uint64 open_time = 3;
+  uint64 close_time = 4;
+  uint32 px_decimals = 5;
+  uint32 sz_decimals = 6;
+  uint64 open = 7;
+  uint64 close = 8;
+  uint64 high = 9;
+  uint64 low = 10;
+  uint64 volume = 11;
+  uint32 trade_count = 12;
+}
+message TradesFrame {
+  string coin = 1;
+  uint32 px_decimals = 2;
+  uint32 sz_decimals = 3;
+  repeated Trade trades = 4;
+}
+message Trade {
+  bool buy = 1;
+  uint64 px = 2;
+  uint64 sz = 3;
+  uint64 time = 4;
+  uint64 tid = 5;
+  bytes hash = 6;
+  bytes buyer = 7;
+  bytes seller = 8;
+}

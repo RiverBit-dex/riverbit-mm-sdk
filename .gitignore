@@ -1,0 +1,41 @@
+# Local agent instructions (never committed)
+AGENTS.md
+CLAUDE.md
+
+# Keys, credentials and local state
+key
+*.key
+*.pem
+.env
+.env.*
+!.env.example
+state/
+STATE_DIR/
+*.journal
+*.log
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Go
+go/bin/
+*.test
+*.out
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Rust
+target/
