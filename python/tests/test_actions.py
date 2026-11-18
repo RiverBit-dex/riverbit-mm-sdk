@@ -152,3 +152,35 @@ def test_nonce_is_unique_under_concurrency() -> None:
     assert len(set(flat)) == len(flat) == 16000
     for chunk in results:  # each thread sees an increasing sequence
         assert chunk == sorted(chunk)
+
+
+# ---------------------------------------------------------------- reserveRequestWeight
+
+
+def test_reserve_request_weight_key_order_and_integer_weight() -> None:
+    from riverbit_mm import ReserveRequestWeight, reserve_cost_micro_usdc
+
+    assert ReserveRequestWeight(1000).to_json() == b'{"type":"reserveRequestWeight","weight":1000}'
+    upper = "0x" + "AB" * 20
+    assert ReserveRequestWeight(7, upper).to_json() == (
+        b'{"type":"reserveRequestWeight","weight":7,"destination":"0x' + b"ab" * 20 + b'"}'
+    )
+    assert reserve_cost_micro_usdc(1000) == 500_000
+    assert ReserveRequestWeight(3).cost_micro_usdc == 1500
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1_000_000_001, True, 1.5, "10"])
+def test_reserve_request_weight_is_validated_before_signing(bad: object) -> None:
+    from riverbit_mm import ReserveRequestWeight
+
+    with pytest.raises(ValueError):
+        ReserveRequestWeight(bad)  # type: ignore[arg-type]
+
+
+def test_reserve_request_weight_bounds_and_destination() -> None:
+    from riverbit_mm import ReserveRequestWeight
+
+    assert ReserveRequestWeight(1).weight == 1
+    assert ReserveRequestWeight(1_000_000_000).weight == 1_000_000_000
+    with pytest.raises(ValueError):
+        ReserveRequestWeight(1, "0x1234")

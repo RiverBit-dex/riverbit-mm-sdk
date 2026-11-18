@@ -21,7 +21,7 @@ Requires Go 1.24 or newer. The module path ends in `/go` because the repository 
 | [`exchange`](exchange/) | `Signer`, action types, `Client` (signing, REST submission, receipts, durable pending journal, recovery), `InfoClient` (REST `/info`), error types |
 | [`binws`](binws/) | bin-ws frames and codec, login, `Session`, reconnecting `Run`, `Router` for typed frames, `Book` for the incremental `l2` stream |
 | [`binws/binwstest`](binws/binwstest/) | In-process fake bin-ws server for your own tests |
-| [`examples/mmcli`](examples/mmcli/) | Example command-line client (market data, `trade`, `recover`) built only on the packages above |
+| [`examples/mmcli`](examples/mmcli/) | Example command-line client (market data, `trade`, `recover`, `quota`) built only on the packages above |
 
 ## Quick start
 
@@ -121,30 +121,35 @@ Orders, cancellations and modifications are submitted with REST `POST /exchange`
 |---|---|---|
 | Action signing (EIP-712, MessagePack key order, with or without a vault) | `exchange.Client.Sign`, `SignedRequest` | Signed bytes and sent bytes are the same bytes. Accepts only the SDK action types (or the result of `ParseAction` for raw JSON); maps and `json.RawMessage` are refused. Reproduces every vector in `testdata/vectors.json` byte for byte |
 | bin-ws login signing (EIP-191) | `exchange.Signer.PersonalSign`, `binws.NewLogin` | `binws.Signer` is an interface, so a remote or hardware key can sign |
-| Actions: `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify` | `exchange.Place`, `Cancel`, `CancelByCloid`, `Modify`, `BatchModify`; `NewPlace`, `LimitOrder`, ... | Prices and sizes are decimal strings end to end. `exchange.Cloid` is a 128-bit client order ID |
-| REST `/info` | `exchange.InfoClient` | `Query` for any type; typed helpers for `chainIdentity`, `metaAndAssetCtxs`, `userRole`, `openOrders`. 429 is retried: it waits for `Retry-After` when present, otherwise capped exponential backoff |
+| Actions: `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`, `reserveRequestWeight` | `exchange.Place`, `Cancel`, `CancelByCloid`, `Modify`, `BatchModify`, `ReserveRequestWeight`; `NewPlace`, `LimitOrder`, `NewReserveRequestWeight`, ... | Prices and sizes are decimal strings end to end. `exchange.Cloid` is a 128-bit client order ID. `weight` is an integer JSON number, validated to 1..1000000000 before signing |
+| REST `/info` | `exchange.InfoClient` | `Query` for any type; typed helpers for `chainIdentity`, `metaAndAssetCtxs`, `userRole`, `openOrders`, `userRateLimit` (`UserRateLimit.Remaining`). 429 is retried: it waits for `Retry-After` when present, otherwise capped exponential backoff |
 | REST `/exchange` | `exchange.Client` | Orders, cancellations and modifications. Redirects are never followed: a 3xx answer is an unknown outcome |
 | bin-ws session | `binws.Dial`, `Session` | First-frame login, subscribe/unsubscribe, ping, `info_json` requests matched by frame id |
 | Reconnect | `binws.Run` | Reconnect, log in again, resubscribe, with backoff |
 | Typed frames | `binws.Router` | `l2`, `l2Book`, `bbo`, `trades`, `candle`; other streams arrive as JSON; the JSON fallbacks of typed streams are handled |
 | Local order book | `binws.Book` | Replays `l2` snapshots and updates (typed and JSON), exact `big.Rat` levels |
 | Receipts | `exchange.ParseReceipt`, `Client.LastReceipt` | Per-leg `resting`, `filled`, `error`, ... A receipt must carry one well-formed status per leg, with an order ID on `resting` and `filled`; a short or malformed one is an unknown outcome |
-| Error classes | `*exchange.ActionRejectedError`, `ErrExecutionRejected`, `*exchange.PartialExecutionError`, `*exchange.RateLimitError`, `*exchange.UnknownOutcomeError` | Rejection of every leg, partial execution, rate limit and unknown outcome are distinct types. `ErrExecutionRejected` means no leg executed; when some legs ran and others were rejected or wait for a fill or trigger, `PartialExecutionError` lists them per leg. A duplicate nonce (code 205) is an unknown outcome: the original may have executed |
+| Error classes | `*exchange.ActionRejectedError`, `ErrExecutionRejected`, `*exchange.PartialExecutionError`, `*exchange.RateLimitError`, `*exchange.UnknownOutcomeError`, `ErrRequestQuotaExceeded` (`IsQuotaRejection`) | Rejection of every leg, partial execution, rate limit and unknown outcome are distinct types. `ErrExecutionRejected` means no leg executed; when some legs ran and others were rejected or wait for a fill or trigger, `PartialExecutionError` lists them per leg. A duplicate nonce (code 205) is an unknown outcome: the original may have executed. A request quota rejection (code 1800, text contains `Too many cumulative requests sent`) is final: `exchange.IsQuotaRejection(err)`, `errors.Is(err, exchange.ErrRequestQuotaExceeded)`, `LegStatus`/`LegOutcome`/`Receipt.IsQuotaRejection()`; the original text stays available |
+| Request quota | `InfoClient.UserRateLimit`, `Client.UserRateLimit` | Cap is 10000 + 1 per USD traded (cancels: `min(cap + 100000, 2 * cap)`); purchased requests add to both. Units: one per order leg, per modify, per batchModify entry, per cancel entry. Over the cap one unit is accepted every 10 seconds. The SDK never retries or buys on its own |
+| Buying requests | `exchange.ReserveRequestWeight` through `Client.Exchange` | 0.0005 USDC per request (`ReserveCostMicroUSDC`), paid by the payer: the signer's account (the master for an API wallet), or the vault for a `NewForVault` client (a per-network setting; `Destination` must then be empty or the vault). To have the master pay for a vault, use a client without a vault and `NewReserveRequestWeightFor(n, vault)`. Success is `ok` with `{"type":"default"}`; overflow (code 1801) is a final rejection |
+| Gateway credential | `Client.SetGatewayCredential`, `InfoClient.SetGatewayCredential` | Optional. Adds `X-RiverBit-MM-Token` to REST `/info` and `/exchange` requests, never to bin-ws or to another URL. Never logged, journaled or printed; a value with a CR, LF or non-ASCII character is refused. It does not change signing, nonces or the taker delay |
 | Nonces | `exchange.Client` | Millisecond timestamps, unique per signer in the process, persisted as a floor in `StateDir` |
-| **Durable pending journal and `recover`** | `Client.StateDir`, `RecoverPending` | Every request is journaled before it is sent. After a timeout, disconnect or restart it is resolved by order ID or client order ID, never re-signed with a new nonce. Audit log and execution-height floor included. Needs a Unix-like OS (advisory file lock) |
+| **Durable pending journal and `recover`** | `Client.StateDir`, `RecoverPending` | Every request is journaled before it is sent. After a timeout, disconnect or restart it is resolved by order ID or client order ID, never re-signed with a new nonce. A pending purchase has no order to look up: it stays pending and is never resent (`ErrPurchaseUnresolved`); compare `userRateLimit` before and after, then `AcknowledgePendingPurchase`. Audit log and execution-height floor included. Needs a Unix-like OS (advisory file lock) |
 | Fake bin-ws server | `binws/binwstest` | Real login check, scripted replies |
 
 Not included: quoting or risk logic, automatic cancellation on shutdown, a cross-host nonce allocator (one process, or processes sharing one `StateDir` on one host, may own a signer), `l2Book` price bucketing over REST.
 
 ## API overview
 
-- Action types: `Place` is the `order` action and `Order` is one order leg; `CancelItem`, `CancelByCloidItem` and `ModifyItem` are the legs of `cancel`, `cancelByCloid` and `batchModify`. Constructors: `NewPlace(orders...)`, `NewCancel(items...)`, `NewCancelByCloid(items...)`, `NewModify(oid, order)`, `NewBatchModify(items...)`.
+- Action types: `Place` is the `order` action and `Order` is one order leg; `CancelItem`, `CancelByCloidItem` and `ModifyItem` are the legs of `cancel`, `cancelByCloid` and `batchModify`; `ReserveRequestWeight` buys request quota and has no legs. Constructors: `NewPlace(orders...)`, `NewCancel(items...)`, `NewCancelByCloid(items...)`, `NewModify(oid, order)`, `NewBatchModify(items...)`, `NewReserveRequestWeight(n)`, `NewReserveRequestWeightFor(n, account)`.
 - `exchange.NewSigner(hexKey)` loads a key. `exchange.New(url, signer)` trades for the signer's own account; `NewForVault(url, signer, vault)` for a vault; `SetPrincipal(master)` records the master an API wallet acts for. Call `VerifySubAccount` before trading for a vault.
 - Set `SignChainID` through `Client.LoadChainID`; there is no default, and a wrong value gives code 91.
 - `Client.Exchange(ctx, action)` signs, sends and reconciles. `LastOrderIDs`, `LastStatuses` and `LastReceipt` describe the last request. `RecoverPending(ctx)` only observes: it queries and never submits.
 - Orders are submitted over REST `POST /exchange`. Set `Client.Queries` to a `*binws.Session` to run the reconciliation queries over bin-ws `info_json`; otherwise they use REST `/info`.
 - Use `exchange.NewCloid()` for a fresh client order ID per order. A cloid must not be reused while any earlier request with it is unresolved: recovery accepts an order found by cloid only if it was created after the request was journaled and has the submitted side, price and size, and otherwise keeps the request pending. When the reply carried a receipt, recovery follows the order IDs in it instead.
 - `binws.Config.OnFrame` receives pushes; `Router.Handle` is a ready callback. `Config.Sign` takes an `exchange.Signer`.
+- Quota: `info.UserRateLimit(ctx, master)` (or `client.UserRateLimit(ctx)` for the client's account) returns the counts as `uint64`, `CumVlm` as a decimal string, and `Remaining()`, which is `max(0, Cap - Used) + Surplus`. A quota rejection is final: back off (one unit per 10 seconds is still accepted), trade, or buy. `client.Exchange(ctx, exchange.NewReserveRequestWeight(100000))` buys 100000 requests; the receipt of a purchase has no legs, so the per-leg checks do not apply to it.
+- Gateway credential: `client.SetGatewayCredential(token)` (and the same on `InfoClient`), optional. The examples read it from `RIVERBIT_MM_TOKEN`.
 - Errors: `errors.As` into `*exchange.UnknownOutcomeError` to get the nonce, account, signed action and cloids to reconcile; `errors.Is(err, exchange.ErrExecutionRejected)` for a final rejection in which no leg executed; `errors.As` into `*exchange.PartialExecutionError` for a request in which some legs executed (`Executed`), some were rejected (`Rejected`) and some wait (`Tracking`). Partial success is not rolled back: never resend the whole request.
 
 Run `go doc github.com/riverbit-dex/riverbit-mm-sdk/go/exchange` (and `.../binws`) for the full reference.
@@ -162,7 +167,15 @@ ACTION_FILE=examples/mmcli/actions/btc-batch-order.sample.json KEY_FILE=./key go
 
 # Resolve a request that was left unknown by an earlier run; never submits
 KEY_FILE=./key go run ./examples/mmcli recover
+
+# Print the request quota (nothing signed is sent)
+KEY_FILE=./key go run ./examples/mmcli quota
+
+# Buy 100000 requests, print the receipt and the quota after
+BUY_REQUESTS=100000 KEY_FILE=./key go run ./examples/mmcli quota
 ```
+
+`quota` sends nothing signed unless `BUY_REQUESTS` is set. A purchase of unknown outcome stays pending and is never resent: compare the quota printed before and after, then clear it with `ACK_PURCHASE_NONCE=<nonce> mmcli recover`.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -176,6 +189,9 @@ KEY_FILE=./key go run ./examples/mmcli recover
 | `STATE_DIR` | `state` | durable pending journal directory |
 | `SIGN_CHAIN_ID` | empty | if set, must equal `chainIdentity` |
 | `ACTION_FILE` | none | action JSON files for `trade` |
+| `BUY_REQUESTS` | none | number of requests `quota` buys (1 to 1000000000); unset means read only |
+| `ACK_PURCHASE_NONCE` | none | with `recover`: clear the pending purchase with this nonce after comparing the quota; sends nothing |
+| `RIVERBIT_MM_TOKEN` | none | optional gateway credential, sent as `X-RiverBit-MM-Token` on REST requests |
 
 The sample actions use asset index 1 and placeholder prices; `trade` checks them against the asset index of `COIN` from `metaAndAssetCtxs` and refuses to send a mismatch. Orders left by `trade` stay on the book until you cancel them; the examples never cancel automatically.
 

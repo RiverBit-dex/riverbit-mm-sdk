@@ -27,6 +27,7 @@ All `/info` queries are POST JSON with a `type` field:
 | `subAccounts` | `user` (the signer's address) | Sub-accounts of a master: entries with `name`, `subAccountUser` and `master`; check that the sub-account you trade for is listed under the signer |
 | `vaultRegistry` | `vault` (address) | Registry entry of a vault: `vaultAddress`, `status` (trade only when `normal`) and `class` |
 | `vaultDetails` | `vaultAddress` | Vault details; `leader` is the account that leads the vault, which must be the signer or the master the signer is an API wallet of |
+| `userRateLimit` | `user` (master or vault) | Request quota of the account: cumulative volume, cap, used and purchased surplus (section 10.1) |
 
 An API wallet signs; the master address identifies the account for queries and subscriptions. To trade for a vault, include top-level `vaultAddress`; use the vault address as `user` for vault queries and subscriptions. The vault must be led by the master, and the signer must be the leader or its authorized API wallet. Do not confuse signer and master addresses. `userRole` returns `agent` with `data.user`, `user`, `subAccount` with `data.master`, `vault`, or `missing`. Vault classes include `protocol`, `guild`, `priority` and `user`.
 
@@ -161,11 +162,64 @@ Use `order.status` for current state. Known values include `open`; terminal `fil
 
 Whole-action execution errors include code 91 (unknown signer/user or bad signing image), 1160 (Guild requires Alo), 203 (nonce too small), 204 (nonce too large), 205 (duplicate nonce), and 97 (too many pending nonces). A duplicate or `action already pending` still requires reconciliation of the original request.
 
-REST limits are per client IP; the per-minute budget is supplied operationally. 429 returns `Retry-After`; excess in-flight requests return 503; bodies over 2 MiB return 413. `/info` weight is 2 for `l2Book`, `allMids`, `clearinghouseState`, `orderStatus`, `spotClearinghouseState`, `exchangeStatus`; 60 for `userRole`; 20 for other types. `/exchange` weight is `1 + floor(count / 40)` for `order`, `cancel`, `cancelByCloid`, `batchModify`, and 1 for `modify`. Query `userRole` only at startup due to its weight. Do not treat a generic HTTP failure as proof of rejection.
+REST limits are per client IP; the per-minute budget is supplied operationally, and a gateway credential lifts them (section 10.2). 429 returns `Retry-After`; excess in-flight requests return 503; bodies over 2 MiB return 413. `/info` weight is 2 for `l2Book`, `allMids`, `clearinghouseState`, `orderStatus`, `spotClearinghouseState`, `exchangeStatus`; 60 for `userRole`; 20 for other types. `/exchange` weight is `1 + floor(count / 40)` for `order`, `cancel`, `cancelByCloid`, `batchModify`, and 1 for `modify`. Query `userRole` only at startup due to its weight. Do not treat a generic HTTP failure as proof of rejection.
 
 bin-ws quotas per IP: 10 simultaneous connections, 30 new connections/minute, 1000 subscriptions, 10 distinct subscribed users, 2000 client messages/minute, 100 outstanding info requests, and 1 MiB per message. Rate excess can send an error then disconnect; excess outstanding requests receive 429; oversized messages disconnect. The server disconnects after 60 seconds with no server-to-client message. On quiet connections send a ping about every 30 seconds; pong is a JSON frame with id 0.
 
 After a disconnect, reconnect and log in, resubscribe and wait for acknowledgments, query open orders and rebuild local state, then process updates. **Keep unknown requests pending and reconcile; do not resend them.** Open-order snapshots do not by themselves establish request finality or a consistent account snapshot.
+
+### 10.1 Request quota per account
+
+Besides the per-IP limits above, every account has a cumulative request quota that is enforced when the action executes. It is counted against the account an action acts for: the master account (API wallets count against their master, and rotating an API wallet does not reset it), or the vault when trading with `vaultAddress`.
+
+| Item | Rule |
+|---|---|
+| Cap | `10000 + 1 request per USD of cumulative traded volume` |
+| Units | `order`: one per leg. `modify`: one. `batchModify`: one per entry. `cancel` / `cancelByCloid`: one per entry |
+| Cancel cap | Cancels use the higher cap `min(cap + 100000, 2 × cap)`, so an account at its cap can still cancel |
+| Over the cap | One unit is accepted every 10 seconds |
+| Purchased requests | Added to both caps; see `reserveRequestWeight` below |
+
+Units of one action are checked in order. Once a unit does not fit, it and every later unit of the same action are rejected, so an action can be partly accepted: the first legs execute normally and the remaining legs carry the quota error. Rejected units are not counted. An accepted unit is counted even if the order is then rejected for another reason.
+
+Query the quota with `/info` `{"type":"userRateLimit","user":"<master-or-vault>"}`:
+
+```json
+{"cumVlm":"25.88","nRequestsCap":10025,"nRequestsSurplus":0,"nRequestsUsed":45}
+```
+
+`nRequestsCap` is the cap for ordinary actions without purchased requests. `nRequestsUsed` is `max(0, used − purchased)` and `nRequestsSurplus` is `max(0, purchased − used)`, so at most one of them is above zero. Remaining ordinary requests are `max(0, nRequestsCap − nRequestsUsed) + nRequestsSurplus`.
+
+A quota rejection has this text; match the part before the parenthesis as a substring:
+
+```
+Too many cumulative requests sent (10045 > 10025) for cumulative volume traded $25.88. Place taker orders to free up 1 request per USDC traded.
+```
+
+| Action | Where the rejection appears |
+|---|---|
+| `order`, `batchModify` | The rejected legs in `statuses[]` as `{"error":"<text>"}` |
+| `cancel`, `cancelByCloid` | The rejected legs in `statuses[]`; the text may end with ` asset=N` |
+| `modify` | `{"status":"err","response":"<text>"}` without a code |
+
+Other actions wrap it as `action rejected by execution (code 1800) (<text>)` or `action rejected at ingress (code 1800) (<text>)`. A quota rejection is final for the affected legs: nothing was placed, cancelled or modified for them. Back off (one unit every 10 seconds is still accepted), reduce quote churn, trade, or buy requests. Monitor the remaining quota rather than waiting for the first rejection; an account that is out of quota while holding resting orders can only cancel at the cancel cap.
+
+**Buying requests.** `reserveRequestWeight` buys `weight` requests at 0.0005 USDC each. It is signed and submitted like an order (section 3) and has this key order:
+
+```json
+{"type":"reserveRequestWeight","weight":1000}
+{"type":"reserveRequestWeight","weight":1000,"destination":"0x2222222222222222222222222222222222222222"}
+```
+
+`weight` is an integer. `destination` is the account that receives the requests; when absent it is the payer. Without `vaultAddress` the payer is the signer's account (for an API wallet, its master). With `vaultAddress` the vault pays for itself: `destination` must be absent or the vault, the signer must lead the vault, and the vault must be operating normally. Whether a vault may pay is a network setting; where it is off, have the master pay by signing without `vaultAddress` and setting `destination` to the vault.
+
+The cost is taken from the payer's perpetual-side USDC that is free to use as margin; balance held only on the spot side does not pay for it.
+
+Success is `{"status":"ok","response":{"type":"default"}}`. A rejected purchase also has `"status":"ok"` and carries the reason in `response.data.statuses`, for example `{"error":"action rejected by execution (code 53) (Insufficient balance to reserve request weight.)"}`: check for an `error` entry before treating a purchase as done. Code 53 is an insufficient balance, 54 a `destination` that does not exist, and 1801 a purchase that would overflow the purchased total; nothing is charged in these cases. The purchase itself uses no quota. Purchased requests are not refundable and do not expire. If the outcome of a purchase is unknown, do not sign it again: compare `userRateLimit` before and after to see whether it executed. Appendix B.3 has signing vectors.
+
+### 10.2 Gateway credential
+
+RiverBit can issue a market maker a gateway credential. Send it on REST requests in the header `X-RiverBit-MM-Token`; requests that carry a valid credential are not subject to the per-IP REST limits. The credential does not replace signing, does not change the request quota of section 10.1 and does not change how orders are sequenced. An unknown credential is ignored without an error, so a typo shows up only as ordinary rate limiting. Treat the credential as a secret: keep it out of source control and logs, and do not send it to any other host.
 
 ## 11. Execution and reconciliation for continuous market making
 
@@ -215,6 +269,8 @@ Budget the entire side against positions, all live orders, cancel-pending orders
 | `1160` | Guild orders and replacements must use `Alo`; correct offending legs and reevaluate before submitting. |
 | `203` / `204` | Check millisecond clock, nonce window and allocator. Resolve only the explicitly rejected request; retain other unknown requests. |
 | `205` / `action already pending` | Reconcile the original action; do not copy it with a new nonce. |
+| `Too many cumulative requests sent` / `1800` | The account's request quota is used up (section 10.1). The affected legs were not executed. Slow down to the 10-second allowance, trade, or buy requests; keep cancels for risk reduction. |
+| `1801` | The purchase would overflow the purchased total; nothing was charged. |
 | `97` | Reduce in-flight concurrency and prioritize recovery; retain existing request state. |
 | `PrecisionExceeded` / `BadDecimal` / tick / minimum-notional rejection | Correct precision, tick, step or notional. The single-status `PrecisionExceeded` response is not an ordinary per-leg array. |
 | `badAloPxRejected` / `oracleRejected` | Reread prices, book and trading state before repricing; do not automatically switch to a taker order. |
@@ -440,3 +496,18 @@ Common inputs:
 | v | `28` |
 
 Vector 1 has a leading zero in `s`. Some libraries omit it (`0x1f8210…`); this is equivalent, and the node left-pads it.
+
+### B.3 Request purchase (`reserveRequestWeight`)
+
+Same key, chain ID 12589 and source `b`. `testdata/vectors.json` holds these and one more with `destination`.
+
+| Item | No vault | Vault `0x1111111111111111111111111111111111111111` |
+|---|---|---|
+| action | `{"type":"reserveRequestWeight","weight":1000}` | `{"type":"reserveRequestWeight","weight":250000}` |
+| nonce | `1792168694980` | `1792168694982` |
+| `msgpack(action)` | `82a474797065b47265736572766552657175657374576569676874a6776569676874cd03e8` | `82a474797065b47265736572766552657175657374576569676874a6776569676874ce0003d090` |
+| connectionId | `0xb1817690256998543181f3f5cf3aab3f63433525009691d72829e93476dfb1bc` | `0xa40ce8c953aab713f35cd7952b260931f6a49f06430bd8f0f395773ba97b7860` |
+| EIP-712 digest | `0x0653847faab1ab78fc33eba97dc6626005486dce39a8c0b3ed5c5c843bf13add` | `0xd9a4cc74d4e6d5a0368c660e8dc20109e8e833c9ca74b0cd3f0614755a3093b0` |
+| r | `0x1834e65ed3775ab0ab69c2d333aacad7470934dd18dbabed5900fbbc28af5b9c` | `0x1b75eb2859fe86e8787196915d3dfd58dcfb8534667f68525486c84692711a3c` |
+| s | `0x51708f25d2f58e3ba8cfc3547cd384af842daf8135f4e271bf6989735669d55d` | `0x18e4352103887691428e0b8a47fdd4cb2021daf54405ea4cfe3072fa07fad9c0` |
+| v | `28` | `27` |

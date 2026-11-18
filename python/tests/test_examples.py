@@ -65,6 +65,16 @@ def fake_api(
                 return httpx.Response(200, json=meta)
             if kind == "userRole":
                 return httpx.Response(200, json={"role": "agent", "data": {"user": MASTER}})
+            if kind == "userRateLimit":
+                return httpx.Response(
+                    200,
+                    json={
+                        "cumVlm": "25.88",
+                        "nRequestsCap": 10025,
+                        "nRequestsSurplus": state.get("bought", 0),
+                        "nRequestsUsed": 45,
+                    },
+                )
             if kind == "openOrders":
                 return httpx.Response(200, json=[])
             if kind == "orderStatus":
@@ -105,6 +115,9 @@ def fake_api(
             return httpx.Response(
                 200, json={"status": "ok", "response": {"data": {"statuses": legs}}}
             )
+        if action["type"] == "reserveRequestWeight":
+            state["bought"] = state.get("bought", 0) + action["weight"]
+            return httpx.Response(200, json={"status": "ok", "response": {"type": "default"}})
         n = len(action.get("cancels", [1]))
         return ok_reply(["success"] * n)
 
@@ -121,6 +134,27 @@ async def test_place_query_cancel_example(capsys: pytest.CaptureFixture[str]) ->
     assert actions == ["order", "cancelByCloid"]
     nonces = [s["body"]["nonce"] for s in seen if s["path"] == "/exchange"]
     assert nonces[0] < nonces[1]
+
+
+async def test_quota_example_reads_only_without_buy_requests(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mod = load("quota")
+    client, seen = fake_api()
+    await mod.run(config(), None, http_client=client)
+    out = capsys.readouterr().out
+    assert "cap=10025 used=45 surplus=0 remaining=9980" in out
+    assert not [s for s in seen if s["path"] == "/exchange"]  # nothing signed or sent
+
+
+async def test_quota_example_buys_only_when_asked(capsys: pytest.CaptureFixture[str]) -> None:
+    mod = load("quota")
+    client, seen = fake_api()
+    await mod.run(config(), 1000, http_client=client)
+    out = capsys.readouterr().out
+    assert "0.500000 USDC" in out and "remaining=10980" in out
+    sent = [s["body"] for s in seen if s["path"] == "/exchange"]
+    assert [b["action"] for b in sent] == [{"type": "reserveRequestWeight", "weight": 1000}]
 
 
 async def test_batch_modify_example(capsys: pytest.CaptureFixture[str]) -> None:

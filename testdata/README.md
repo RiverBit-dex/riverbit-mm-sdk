@@ -49,7 +49,7 @@ An `actions[]` entry:
 
 Test: parse `action_json` into your typed action, serialize it again and require the same bytes as `action_json`; then reproduce `msgpack_hex`, `connection_id`, `digest` and the signature. A request body built from the entry is `{"action":<action_json>,"nonce":<nonce>,"signature":{...}}` plus, for a vault, `"vaultAddress":"<vault_address>"`.
 
-Current action vectors: `order` (single leg, with a client order ID, two legs, `Gtc` with reduce-only), `cancel`, `cancelByCloid`, `modify` and `batchModify`, with and without a vault. Login vectors: the guide vector and a second host.
+Current action vectors: `order` (single leg, with a client order ID, two legs, `Gtc` with reduce-only), `cancel`, `cancelByCloid`, `modify` and `batchModify`, with and without a vault, and `reserveRequestWeight` (plain, with `destination`, with a vault). Login vectors: the guide vector and a second host.
 
 ## `frames.json`
 

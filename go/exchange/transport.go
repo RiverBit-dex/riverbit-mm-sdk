@@ -30,7 +30,7 @@ const exchangeTimeout = 20 * time.Second
 func (c *Client) postREST(ctx context.Context, body []byte, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, exchangeTimeout)
 	defer cancel()
-	if err := postRaw(ctx, c.HTTP, c.URL, "/exchange", body, out); err != nil {
+	if err := postRaw(ctx, c.HTTP, c.URL, "/exchange", body, out, c.token); err != nil {
 		return fmt.Errorf("REST exchange: %w", err)
 	}
 	return nil

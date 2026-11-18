@@ -1,12 +1,14 @@
 // Command mmcli is an example market maker client built on the binws and
-// exchange packages. It has three modes:
+// exchange packages. It has four modes:
 //
 //	mmcli          log market data (book, trades, candles, order events)
 //	mmcli trade    submit the actions listed in ACTION_FILE and reconcile them
 //	mmcli recover  resolve a request whose outcome was unknown, never resending it
+//	mmcli quota    print the request quota; with BUY_REQUESTS=<n> also buy n requests
 //
 // Settings come from environment variables; see config.go and README.md. The
-// private key is read from KEY_FILE and never printed. The example contains
+// private key is read from KEY_FILE and the optional gateway credential from
+// RIVERBIT_MM_TOKEN; neither is ever printed. The example contains
 // no quoting strategy.
 package main
 
@@ -37,9 +39,16 @@ func main() {
 	defer stop()
 	if len(os.Args) > 1 {
 		command := os.Args[1]
-		if len(os.Args) != 2 || (command != "trade" && command != "recover") {
-			logger.Error("usage: mmcli [trade|recover]")
+		if len(os.Args) != 2 || (command != "trade" && command != "recover" && command != "quota") {
+			logger.Error("usage: mmcli [trade|recover|quota]")
 			os.Exit(1)
+		}
+		if command == "quota" {
+			if err := runQuota(ctx, cfg, logger, os.Stdout); err != nil {
+				logger.Error("quota failed", "error", err)
+				os.Exit(1)
+			}
+			return
 		}
 		if err := runTrade(ctx, cfg, logger, command == "recover"); err != nil {
 			logger.Error(command+" failed", "error", err)
@@ -50,7 +59,12 @@ func main() {
 
 	logger.Info("starting mmcli", "coin", cfg.Coin, "bin_ws", cfg.BinWSURL, "login_host", cfg.BinWSLoginHost, "vault_configured", cfg.GuildVault != "")
 	checkCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
-	err := exchange.NewInfoClient(cfg.APIGatewayURL).Check(checkCtx)
+	infoClient := exchange.NewInfoClient(cfg.APIGatewayURL)
+	if err := infoClient.SetGatewayCredential(cfg.GatewayCredential); err != nil {
+		logger.Error("invalid RIVERBIT_MM_TOKEN", "error", err)
+		os.Exit(1)
+	}
+	err := infoClient.Check(checkCtx)
 	cancel()
 	if err != nil {
 		logger.Warn("HTTP /info check failed; continuing with bin-ws only", "error", err)
@@ -98,6 +112,9 @@ func newClient(cfg Config, vault string) (*exchange.Client, error) {
 	}
 	if err != nil {
 		return nil, fmt.Errorf("configure signer: invalid address")
+	}
+	if err := client.SetGatewayCredential(cfg.GatewayCredential); err != nil {
+		return nil, fmt.Errorf("RIVERBIT_MM_TOKEN: %w", err)
 	}
 	return client, nil
 }
@@ -199,10 +216,16 @@ func runTrade(ctx context.Context, cfg Config, logger *slog.Logger, recoverOnly 
 	account := client.AccountAddress()
 	var recoveryErr error
 	if recoverOnly {
+		if nonce := os.Getenv("ACK_PURCHASE_NONCE"); nonce != "" {
+			return acknowledgePurchase(client, nonce)
+		}
 		observeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		recoveryErr = client.RecoverPending(observeCtx)
 		cancel()
 		var partial *exchange.PartialExecutionError
+		if errors.Is(recoveryErr, exchange.ErrPurchaseUnresolved) {
+			return purchaseUnresolved(recoveryErr)
+		}
 		if recoveryErr != nil && !errors.Is(recoveryErr, exchange.ErrExecutionRejected) && !errors.As(recoveryErr, &partial) {
 			return fmt.Errorf("recovery incomplete; keep STATE_DIR and run recover again: %w", recoveryErr)
 		}

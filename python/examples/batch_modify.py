@@ -38,9 +38,13 @@ async def run(
     http_client: httpx.AsyncClient | None = None,
 ) -> None:
     async with (
-        InfoClient(cfg.base_url, http_client=http_client) as info,
+        InfoClient(cfg.base_url, http_client=http_client, gateway_token=cfg.gateway_token) as info,
         ExchangeClient(
-            cfg.base_url, cfg.signer, vault_address=cfg.vault, http_client=http_client
+            cfg.base_url,
+            cfg.signer,
+            vault_address=cfg.vault,
+            http_client=http_client,
+            gateway_token=cfg.gateway_token,
         ) as exchange,
     ):
         asset = (await info.assets())[coin]

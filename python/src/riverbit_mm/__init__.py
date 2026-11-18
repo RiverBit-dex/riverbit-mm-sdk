@@ -20,9 +20,14 @@ from .actions import (
     ModifyItem,
     Order,
     Place,
+    ReserveRequestWeight,
+    reserve_cost_micro_usdc,
 )
 from .book import Book, BookError, Level
 from .errors import (
+    QUOTA_ERROR_TEXT,
+    QUOTA_EXHAUSTED_CODE,
+    RESERVE_OVERFLOW_CODE,
     ActionRejected,
     HttpError,
     LoginFailed,
@@ -34,6 +39,7 @@ from .errors import (
     RiverBitError,
     SessionClosed,
     UnknownOutcome,
+    is_quota_error,
 )
 from .exchange import ExchangeClient
 from .frames import (
@@ -49,7 +55,7 @@ from .frames import (
     Trades,
     format_fixed,
 )
-from .info import Asset, InfoClient, parse_meta
+from .info import Asset, InfoClient, UserRateLimit, parse_meta, parse_user_rate_limit
 from .nonce import NonceSource, shared_nonce_source
 from .receipts import Leg, Receipt
 from .reconcile import (
@@ -65,6 +71,9 @@ from .ws import BinWsSession, Connected, Disconnected
 __version__ = "0.1.0.dev0"
 
 __all__ = [
+    "QUOTA_ERROR_TEXT",
+    "QUOTA_EXHAUSTED_CODE",
+    "RESERVE_OVERFLOW_CODE",
     "Action",
     "ActionRejected",
     "Asset",
@@ -105,6 +114,7 @@ __all__ = [
     "Receipt",
     "Reconciliation",
     "RequestTimeout",
+    "ReserveRequestWeight",
     "RiverBitError",
     "ServerFrame",
     "SessionClosed",
@@ -114,10 +124,14 @@ __all__ = [
     "Trade",
     "Trades",
     "UnknownOutcome",
+    "UserRateLimit",
     "format_fixed",
+    "is_quota_error",
     "order_state",
     "parse_meta",
+    "parse_user_rate_limit",
     "reconcile_unknown",
+    "reserve_cost_micro_usdc",
     "shared_nonce_source",
     "subscriptions",
     "wait_reconciled",

@@ -11,7 +11,10 @@ import httpx
 
 from ._http import HttpCore, SleepFn
 from .actions import Cloid
+from .errors import ProtocolError
 from .signing import normalize_address
+
+_U64_MAX = (1 << 64) - 1
 
 
 @dataclass(frozen=True)
@@ -33,6 +36,64 @@ def parse_meta(meta_and_asset_ctxs: Any) -> dict[str, Asset]:
     return assets
 
 
+def _count(name: str, value: Any) -> int:
+    """An unsigned 64-bit count sent as a JSON number or a decimal string."""
+    if isinstance(value, bool):
+        raise ProtocolError(f"userRateLimit {name} is not a count")
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        value = int(value)
+    if not isinstance(value, int) or not 0 <= value <= _U64_MAX:
+        raise ProtocolError(f"userRateLimit {name} is not an unsigned 64-bit count")
+    return value
+
+
+@dataclass(frozen=True)
+class UserRateLimit:
+    """The ``userRateLimit`` answer: the request quota of one account.
+
+    ``cum_vlm`` is the cumulative traded volume in USD, kept as the decimal string
+    the node sent. ``requests_cap`` is ``10000 + floor(cum_vlm)`` for ordinary
+    actions, **without** purchased requests. ``requests_used`` is
+    ``max(0, used - purchased)`` and ``requests_surplus`` is
+    ``max(0, purchased - used)``: at most one of them is above zero.
+
+    Each account (the master, or a vault when trading for a vault; an API wallet
+    counts against the account it acts for) has a cumulative cap of ``10000`` plus
+    one request per USD traded. An ``order`` leg, a ``modify``, a ``batchModify``
+    entry and a ``cancel`` / ``cancelByCloid`` entry cost one request each. Cancels
+    have a higher cap, ``min(cap + 100000, 2 * cap)``. Over the cap, one request is
+    still accepted every 10 seconds. Purchased requests raise both caps.
+    """
+
+    cum_vlm: str
+    requests_cap: int
+    requests_used: int
+    requests_surplus: int
+    raw: Any = None
+
+    @property
+    def remaining(self) -> int:
+        """Remaining ordinary requests:
+        ``max(0, cap - used) + surplus`` (saturating, never negative)."""
+        return max(0, self.requests_cap - self.requests_used) + self.requests_surplus
+
+
+def parse_user_rate_limit(answer: Any) -> UserRateLimit:
+    """Parse a ``userRateLimit`` answer; raises :class:`ProtocolError` if malformed."""
+    if not isinstance(answer, dict):
+        raise ProtocolError("userRateLimit reply is not an object")
+    vlm = answer.get("cumVlm")
+    if not isinstance(vlm, str):
+        raise ProtocolError("userRateLimit cumVlm is not a decimal string")
+    return UserRateLimit(
+        vlm,
+        _count("nRequestsCap", answer.get("nRequestsCap")),
+        _count("nRequestsUsed", answer.get("nRequestsUsed")),
+        _count("nRequestsSurplus", answer.get("nRequestsSurplus")),
+        answer,
+    )
+
+
 def _user(address: str) -> str:
     return normalize_address(address)
 
@@ -44,6 +105,10 @@ class InfoClient:
     A 429 answer is retried after the server's ``Retry-After`` (or an exponential
     backoff) and raises :class:`~riverbit_mm.RateLimited` once the retries are used
     up. The client also satisfies :class:`riverbit_mm.reconcile.InfoSource`.
+
+    ``gateway_token`` is an optional gateway credential issued to a market maker. When
+    set, every request carries it in the ``X-RiverBit-MM-Token`` header. See
+    :class:`~riverbit_mm._http.HttpCore`.
     """
 
     def __init__(
@@ -54,10 +119,16 @@ class InfoClient:
         timeout: float = 15.0,
         max_retries: int = 5,
         sleep: SleepFn | None = None,
+        gateway_token: str | None = None,
         _core: HttpCore | None = None,
     ) -> None:
         self._core = _core or HttpCore(
-            base_url, http_client=http_client, timeout=timeout, max_retries=max_retries, sleep=sleep
+            base_url,
+            http_client=http_client,
+            timeout=timeout,
+            max_retries=max_retries,
+            sleep=sleep,
+            gateway_token=gateway_token,
         )
 
     async def __aenter__(self) -> InfoClient:
@@ -128,3 +199,11 @@ class InfoClient:
 
     async def clearinghouse_state(self, user: str) -> Any:
         return await self.query({"type": "clearinghouseState", "user": _user(user)})
+
+    async def user_rate_limit(self, user: str) -> UserRateLimit:
+        """The request quota of ``user``: the master account or a vault, not an API wallet.
+
+        A node that cannot answer replies HTTP 501, raised as :class:`HttpError`.
+        """
+        answer = await self.query({"type": "userRateLimit", "user": _user(user)})
+        return parse_user_rate_limit(answer)

@@ -31,6 +31,13 @@ type Config struct {
 	StateDir string
 	// SignChainID, if set, must equal the chainIdentity answer.
 	SignChainID string
+	// GatewayCredential is the optional gateway credential RiverBit may issue to
+	// lift the per-IP REST limits (RIVERBIT_MM_TOKEN). It is sent as a header
+	// on REST requests only and is never printed or logged.
+	GatewayCredential string
+	// BuyRequests is the number of requests the quota command buys
+	// (BUY_REQUESTS). Empty means the command only reads and sends nothing signed.
+	BuyRequests string
 }
 
 // Defaults.
@@ -52,6 +59,9 @@ func LoadConfig() Config {
 		KeyFile:        value("KEY_FILE", "key"),
 		StateDir:       value("STATE_DIR", "state"),
 		SignChainID:    os.Getenv("SIGN_CHAIN_ID"),
+
+		GatewayCredential: os.Getenv("RIVERBIT_MM_TOKEN"),
+		BuyRequests:       strings.TrimSpace(os.Getenv("BUY_REQUESTS")),
 	}
 	return cfg
 }

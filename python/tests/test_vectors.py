@@ -17,6 +17,7 @@ from riverbit_mm import (
     ModifyItem,
     Order,
     Place,
+    ReserveRequestWeight,
     Signer,
 )
 from riverbit_mm.signing import (
@@ -133,6 +134,8 @@ def _typed_action(obj: dict[str, Any]) -> Any:
         return Modify(obj["oid"], _order(obj["order"]))
     if kind == "batchModify":
         return BatchModify([ModifyItem(m["oid"], _order(m["order"])) for m in obj["modifies"]])
+    if kind == "reserveRequestWeight":
+        return ReserveRequestWeight(obj["weight"], obj.get("destination"))
     raise AssertionError(f"vector with an action type the SDK does not build: {kind}")
 
 

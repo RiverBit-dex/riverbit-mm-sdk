@@ -16,6 +16,27 @@ use std::time::Duration;
 use crate::receipt::LegStatus;
 use crate::signing::SignedRequest;
 
+/// Execution code: the cumulative request quota is exhausted.
+pub const CODE_QUOTA_EXHAUSTED: u32 = 1800;
+/// Execution code: a `reserveRequestWeight` purchase would overflow the
+/// purchased total.
+pub const CODE_PURCHASE_OVERFLOW: u32 = 1801;
+/// The text every quota rejection contains (`Too many cumulative requests
+/// sent (...) for cumulative volume traded $...`). Match it as a substring: it
+/// may be wrapped in `action rejected by execution (code 1800) (...)` and a
+/// cancel leg appends ` asset=N`.
+pub const QUOTA_REJECTION_TEXT: &str = "Too many cumulative requests sent";
+
+/// True if `text` is a quota rejection: a per-leg error, or the text of a
+/// whole-action rejection. A quota rejection is final (nothing executed for
+/// that leg or action). Back off (one request per 10 seconds is still
+/// accepted once over the cap), trade to free up requests, or buy requests
+/// with [`ReserveRequestWeight`](crate::actions::ReserveRequestWeight); the
+/// SDK never retries or buys on its own.
+pub fn is_quota_rejection(text: &str) -> bool {
+    text.contains(QUOTA_REJECTION_TEXT)
+}
+
 /// Result alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -92,6 +113,13 @@ impl Error {
             _ => None,
         }
     }
+
+    /// True for a whole-action rejection because the request quota is
+    /// exhausted (see [`Rejected::is_quota_exhausted`]). Per-leg quota errors
+    /// are in the receipt: see [`Receipt::quota_rejected_legs`](crate::Receipt::quota_rejected_legs).
+    pub fn is_quota_exhausted(&self) -> bool {
+        self.as_rejected().is_some_and(Rejected::is_quota_exhausted)
+    }
 }
 
 fn fmt_retry_after(retry_after: &Option<Duration>) -> String {
@@ -114,6 +142,26 @@ pub struct Rejected {
     pub legs: Vec<LegStatus>,
     /// The raw reply body.
     pub raw: String,
+}
+
+impl Rejected {
+    /// True if the request quota is exhausted: code 1800, or the message (or a
+    /// leg error) contains `Too many cumulative requests sent`. The rejection
+    /// is final. The original text stays in [`message`](Self::message).
+    pub fn is_quota_exhausted(&self) -> bool {
+        self.code == Some(CODE_QUOTA_EXHAUSTED)
+            || is_quota_rejection(&self.message)
+            || self
+                .legs
+                .iter()
+                .any(|l| matches!(l, LegStatus::Error(e) if is_quota_rejection(e)))
+    }
+
+    /// True if a `reserveRequestWeight` purchase was refused because it would
+    /// overflow the purchased total (code 1801).
+    pub fn is_purchase_overflow(&self) -> bool {
+        self.code == Some(CODE_PURCHASE_OVERFLOW)
+    }
 }
 
 impl fmt::Display for Rejected {

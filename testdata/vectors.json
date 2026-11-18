@@ -231,6 +231,54 @@
         "s": "0x41c92b59c7ed3ed8369f991b4605370f6486d0ed5074e6d2d22e739ea915d035",
         "v": 28
       }
+    },
+    {
+      "name": "reserve-request-weight-no-vault",
+      "chain_id": 12589,
+      "source": "b",
+      "nonce": 1792168694980,
+      "vault_address": null,
+      "action_json": "{\"type\":\"reserveRequestWeight\",\"weight\":1000}",
+      "msgpack_hex": "82a474797065b47265736572766552657175657374576569676874a6776569676874cd03e8",
+      "connection_id": "0xb1817690256998543181f3f5cf3aab3f63433525009691d72829e93476dfb1bc",
+      "digest": "0x0653847faab1ab78fc33eba97dc6626005486dce39a8c0b3ed5c5c843bf13add",
+      "signature": {
+        "r": "0x1834e65ed3775ab0ab69c2d333aacad7470934dd18dbabed5900fbbc28af5b9c",
+        "s": "0x51708f25d2f58e3ba8cfc3547cd384af842daf8135f4e271bf6989735669d55d",
+        "v": 28
+      }
+    },
+    {
+      "name": "reserve-request-weight-destination",
+      "chain_id": 12589,
+      "source": "b",
+      "nonce": 1792168694981,
+      "vault_address": null,
+      "action_json": "{\"type\":\"reserveRequestWeight\",\"weight\":1000,\"destination\":\"0x2222222222222222222222222222222222222222\"}",
+      "msgpack_hex": "83a474797065b47265736572766552657175657374576569676874a6776569676874cd03e8ab64657374696e6174696f6ed92a307832323232323232323232323232323232323232323232323232323232323232323232323232323232",
+      "connection_id": "0xdff2f22aa998fb3993fea3497b05bcbc6b94b7343e76e4fd17ee8c0493f7d2ed",
+      "digest": "0x308fc932425e4f10e782f4a468708f17ad8f2c1cd7d1b820cc15f9f48b5c10a6",
+      "signature": {
+        "r": "0x157d94d4a42e8cd7c663f798eea7fa7472203987978c286f3e3f0301b6db6e4f",
+        "s": "0x6ba723ebf325af687a3febd492ec25c84bb701d8a51f36a6bed5697da56b118c",
+        "v": 28
+      }
+    },
+    {
+      "name": "reserve-request-weight-vault",
+      "chain_id": 12589,
+      "source": "b",
+      "nonce": 1792168694982,
+      "vault_address": "0x1111111111111111111111111111111111111111",
+      "action_json": "{\"type\":\"reserveRequestWeight\",\"weight\":250000}",
+      "msgpack_hex": "82a474797065b47265736572766552657175657374576569676874a6776569676874ce0003d090",
+      "connection_id": "0xa40ce8c953aab713f35cd7952b260931f6a49f06430bd8f0f395773ba97b7860",
+      "digest": "0xd9a4cc74d4e6d5a0368c660e8dc20109e8e833c9ca74b0cd3f0614755a3093b0",
+      "signature": {
+        "r": "0x1b75eb2859fe86e8787196915d3dfd58dcfb8534667f68525486c84692711a3c",
+        "s": "0x18e4352103887691428e0b8a47fdd4cb2021daf54405ea4cfe3072fa07fad9c0",
+        "v": 27
+      }
     }
   ]
 }

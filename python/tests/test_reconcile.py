@@ -219,3 +219,26 @@ def test_targets_of() -> None:
     assert targets_of(Cancel([CancelItem(0, 5)]).to_json()).cancel_oids == (5,)
     with pytest.raises(ValueError):
         targets_of(json.dumps({"type": "withdraw"}).encode())
+
+
+async def test_purchase_has_nothing_to_look_up_and_is_never_resolved() -> None:
+    from riverbit_mm import ReserveRequestWeight
+
+    action = ReserveRequestWeight(1000).to_json()
+    targets = targets_of(action)
+    assert targets.action_type == "reserveRequestWeight"
+    assert not (targets.placed_cloids or targets.cancel_oids or targets.cancel_cloids)
+    request = Signer("0x" + "01" * 32).sign_action(action, 1000, chain_id=1)
+    info = FakeInfo({})
+    sleeps: list[float] = []
+
+    async def no_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    result = await reconcile_unknown(info, USER, request)
+    assert not result.resolved and not result.targets_settled and not result.request_final
+    assert not result.lookup_supported and result.hold_cloids == ()
+    assert "userRateLimit" in result.unresolved[0]
+    # Polling returns at once: there is nothing to wait for, and nothing was queried.
+    waited = await wait_reconciled(info, USER, request, timeout=5, sleep=no_sleep)
+    assert not waited.resolved and sleeps == [] and info.queries == []

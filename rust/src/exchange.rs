@@ -79,14 +79,32 @@ impl ExchangeClient {
         self
     }
 
+    /// Sets the optional gateway credential. Every REST request of this client
+    /// then carries it in the `X-RiverBit-MM-Token` header. An empty string
+    /// clears it. It is never logged and never part of `Debug` or error
+    /// output; characters that are not valid in a header value (CR, LF, spaces,
+    /// non-ASCII) are rejected here. It does not change signing, nonces or
+    /// the request body: it only lifts gateway rate limits, and a wrong one is
+    /// treated as none.
+    ///
+    /// If you supply your own `reqwest` client it must not follow redirects,
+    /// or the credential would go to the redirect target.
+    pub fn with_gateway_token(mut self, token: &str) -> Result<Self> {
+        self.transport.rest.set_token(token)?;
+        Ok(self)
+    }
+
     /// The signing address.
     pub fn signer_address(&self) -> Address {
         self.signer.address()
     }
 
-    /// Signs `action` with a fresh nonce without sending it.
+    /// Signs `action` with a fresh nonce without sending it. Fails before
+    /// signing if the action is invalid or does not fit this client's account
+    /// (see [`Action::check_account`]).
     pub fn prepare(&self, action: &impl Action) -> Result<SignedRequest> {
         let json = action.to_json()?;
+        action.check_account(self.vault.as_ref())?;
         self.signer.sign_request(
             json,
             self.nonces.next(),
@@ -143,5 +161,18 @@ impl ExchangeClient {
                 }
             }),
         }
+    }
+}
+
+impl std::fmt::Debug for ExchangeClient {
+    // The signer's own `Debug` shows only its address; the gateway
+    // credential is reported as set or unset, never its value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExchangeClient")
+            .field("base", &self.transport.rest.base())
+            .field("signer", &self.signer)
+            .field("vault", &self.vault)
+            .field("gateway_token", &self.transport.rest.has_token())
+            .finish()
     }
 }

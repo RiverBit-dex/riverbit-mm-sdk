@@ -16,6 +16,24 @@ SleepFn = Callable[[float], Awaitable[None]]
 
 DEFAULT_TIMEOUT = 15.0
 MAX_RESPONSE_BYTES = 4 << 20
+#: Header that carries the optional gateway credential on REST requests.
+GATEWAY_TOKEN_HEADER = "X-RiverBit-MM-Token"
+
+
+def check_gateway_token(token: str | None) -> str | None:
+    """Validate an optional gateway credential; ``None`` and ``""`` mean "not set".
+
+    Raises :class:`ValueError` (never echoing the value) if it holds a character that
+    is not valid in an HTTP header value: only printable ASCII is accepted, so CR,
+    LF, other control characters and non-ASCII text are refused.
+    """
+    if token is None or token == "":
+        return None
+    if not isinstance(token, str):
+        raise TypeError("gateway token must be a string")
+    if not all(0x20 <= ord(c) <= 0x7E for c in token):
+        raise ValueError("gateway token contains a character that is invalid in an HTTP header")
+    return token
 
 
 def parse_retry_after(value: str | None, *, now: float | None = None) -> float | None:
@@ -41,6 +59,10 @@ class HttpCore:
 
     Pass ``http_client`` to supply your own ``httpx.AsyncClient`` (proxies,
     custom transport, tests). A client passed in is never closed by the SDK.
+
+    ``gateway_token`` is the optional gateway credential. When set, every request to
+    ``base_url`` carries it in the ``X-RiverBit-MM-Token`` header and redirects are not
+    followed, so it cannot be forwarded to another URL. It is kept out of ``repr``.
     """
 
     def __init__(
@@ -52,6 +74,7 @@ class HttpCore:
         max_retries: int = 5,
         max_retry_after: float = 60.0,
         sleep: SleepFn | None = None,
+        gateway_token: str | None = None,
     ) -> None:
         if not base_url:
             raise ValueError("base_url is required")
@@ -61,6 +84,7 @@ class HttpCore:
         self.max_retry_after = max_retry_after
         self._sleep: SleepFn = sleep or asyncio.sleep
         self._client = http_client
+        self._gateway_token = check_gateway_token(gateway_token)
         self._owns_client = http_client is None
 
     @property
@@ -78,12 +102,26 @@ class HttpCore:
         self, path: str, body: bytes, timeout: float | None = None
     ) -> httpx.Response:
         """One POST, no retry, no status check."""
+        headers = {"Content-Type": "application/json"}
+        if self._gateway_token is None:
+            return await self.client.post(
+                self.base_url + path,
+                content=body,
+                headers=headers,
+                timeout=self.timeout if timeout is None else timeout,
+            )
+        headers[GATEWAY_TOKEN_HEADER] = self._gateway_token
         return await self.client.post(
             self.base_url + path,
             content=body,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             timeout=self.timeout if timeout is None else timeout,
+            follow_redirects=False,
         )
+
+    def __repr__(self) -> str:
+        state = "set" if self._gateway_token else "unset"
+        return f"HttpCore(base_url={self.base_url!r}, gateway_token={state})"
 
     async def post_json(self, path: str, payload: bytes) -> Any:
         """POST a read request; retry on 429 honouring ``Retry-After``.

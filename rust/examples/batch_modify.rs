@@ -33,8 +33,7 @@ async fn main() {
         .expect("metaAndAssetCtxs")
         .meta;
     let asset = meta.asset_index(&env.coin).expect("unknown coin");
-    let exchange = ExchangeClient::new(&env.base_url, env.signer.clone(), domain)
-        .expect("build the exchange client");
+    let exchange: ExchangeClient = env.exchange(domain);
 
     let (bid_cloid, ask_cloid) = (Cloid::random().unwrap(), Cloid::random().unwrap());
     let buy = Order::limit(asset, true, bid.clone(), size.clone(), Tif::Alo).with_cloid(bid_cloid);

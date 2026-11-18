@@ -13,6 +13,27 @@ if TYPE_CHECKING:
     from .signing import SignedRequest
 
 
+#: Execution code: the cumulative request quota of the account is used up.
+QUOTA_EXHAUSTED_CODE = 1800
+#: Execution code: a request purchase would overflow the purchased total.
+RESERVE_OVERFLOW_CODE = 1801
+#: Text carried by every quota rejection. Match it as a **substring**: the node may
+#: wrap it (``action rejected by execution (code 1800) (...)``) and a cancel leg
+#: appends `` asset=N``.
+QUOTA_ERROR_TEXT = "Too many cumulative requests sent"
+
+
+def is_quota_error(text: object) -> bool:
+    """True if ``text`` (a per-leg error or a rejection message) is a quota rejection.
+
+    A quota rejection is final: nothing executed for that leg or action. Back off
+    (one request per 10 seconds is still accepted), trade to earn requests, or buy
+    requests with :class:`~riverbit_mm.ReserveRequestWeight`. The SDK never retries
+    or buys on its own.
+    """
+    return isinstance(text, str) and QUOTA_ERROR_TEXT in text
+
+
 class RiverBitError(Exception):
     """Base class of every SDK exception."""
 
@@ -50,6 +71,11 @@ class ActionRejected(RiverBitError):
     91, 1160, 203, 204, 205, 97). Per-leg rejections do not raise: they appear
     in :attr:`Receipt.legs <riverbit_mm.Receipt>`. The nonce of a rejected action is
     spent; build a new action for any retry.
+
+    :attr:`quota_exhausted` tells a quota rejection (code 1800) from other
+    rejections. It is final, like every :class:`ActionRejected`: nothing executed.
+    Back off, trade or buy requests; do not retry in a tight loop. The original text
+    stays available as ``str(exc)``.
     """
 
     def __init__(
@@ -65,7 +91,21 @@ class ActionRejected(RiverBitError):
         self.nonce = nonce
         self.response = response
         self.request = request
-        super().__init__(message if code is None else f"{message} (code {code})")
+        super().__init__(
+            message if code is None or f"(code {code})" in message else f"{message} (code {code})"
+        )
+
+    @property
+    def quota_exhausted(self) -> bool:
+        """True for a request-quota rejection (code 1800 or the quota text)."""
+        return self.code == QUOTA_EXHAUSTED_CODE or is_quota_error(
+            self.args[0] if self.args else ""
+        )
+
+    @property
+    def reserve_overflow(self) -> bool:
+        """True if a request purchase was rejected because it would overflow (code 1801)."""
+        return self.code == RESERVE_OVERFLOW_CODE
 
 
 class UnknownOutcome(RiverBitError):

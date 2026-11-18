@@ -121,6 +121,8 @@ async def order_state(info: InfoSource, user: str, key: int | Cloid | str) -> Or
 
 
 _CANCEL_ACTIONS = frozenset({"cancel", "cancelByCloid"})
+#: Actions that leave nothing to look up (no oid, no cloid). Today: the request purchase.
+_NO_LOOKUP_ACTIONS = frozenset({"reserveRequestWeight"})
 
 
 @dataclass(frozen=True)
@@ -137,7 +139,12 @@ class Targets:
 
 
 def targets_of(action_json: bytes) -> Targets:
-    """List the oids and cloids needed to reconcile ``action_json``."""
+    """List the oids and cloids needed to reconcile ``action_json``.
+
+    A ``reserveRequestWeight`` purchase has no oid or cloid: it returns empty targets.
+    :func:`reconcile_request` never reports such a request as resolved; compare
+    ``userRateLimit`` (``requests_surplus`` and ``requests_used``) before and after.
+    """
     obj = json.loads(action_json)
     kind = obj["type"]
     placed: list[str] = []
@@ -165,6 +172,8 @@ def targets_of(action_json: bytes) -> Targets:
     elif kind == "modify":
         replaced.append(obj["oid"])
         take(obj["order"], obj["oid"])
+    elif kind in _NO_LOOKUP_ACTIONS:
+        pass
     elif kind == "batchModify":
         for item in obj["modifies"]:
             replaced.append(item["oid"])
@@ -217,6 +226,9 @@ class Reconciliation:
     targets_settled: bool = False
     request_final: bool = False
     hold_cloids: tuple[str, ...] = ()
+    #: False when the request names nothing that can be looked up (a request purchase):
+    #: ``resolved`` stays false and polling cannot change that.
+    lookup_supported: bool = True
 
 
 async def reconcile_request(
@@ -226,6 +238,24 @@ async def reconcile_request(
     action_json = request.action_json if isinstance(request, SignedRequest) else request
     nonce = request.nonce if isinstance(request, SignedRequest) else None
     t = targets_of(action_json)
+    if t.action_type in _NO_LOOKUP_ACTIONS:
+        return Reconciliation(
+            nonce,
+            (),
+            (),
+            (),
+            0,
+            False,
+            (
+                "a request purchase has no oid or cloid to look up: compare userRateLimit "
+                "(requests_surplus and requests_used) before and after, keep the request "
+                "pending and never resend it",
+            ),
+            False,
+            False,
+            (),
+            False,
+        )
 
     placed = [await order_state(info, user, c) for c in t.placed_cloids]
     cancels = [await order_state(info, user, o) for o in t.cancel_oids]
@@ -299,11 +329,12 @@ async def wait_reconciled(
 
     Returns the last pass either way; check ``.resolved``. A cancel request returns
     as soon as its target is terminal, with ``resolved`` still false (polling cannot
-    confirm the request itself). A timeout is not evidence: leave the request pending.
+    confirm the request itself). A request purchase returns at once, unresolved: it has
+    nothing to look up. A timeout is not evidence: leave the request pending.
     """
     deadline = time.monotonic() + timeout
     while True:
         result = await reconcile_unknown(info, user, outcome)
-        if result.targets_settled or time.monotonic() >= deadline:
+        if result.targets_settled or not result.lookup_supported or time.monotonic() >= deadline:
             return result
         await sleep(interval)

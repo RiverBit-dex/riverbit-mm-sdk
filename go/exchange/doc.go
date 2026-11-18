@@ -5,10 +5,11 @@
 //
 //   - Signer: holds the API wallet or master key; signs bin-ws logins.
 //   - Action types: Place (the order action) with its Order legs, Cancel,
-//     CancelByCloid, Modify and BatchModify, plus Cloid. Field order is the
+//     CancelByCloid, Modify, BatchModify and ReserveRequestWeight (buys request
+//     quota), plus Cloid. Field order is the
 //     signing key order. Prices and sizes are decimal strings.
 //   - InfoClient: unsigned REST /info queries (chain identity, asset metadata,
-//     user role, open orders, ...) with Retry-After handling.
+//     user role, open orders, userRateLimit, ...) with Retry-After handling.
 //   - Client: signs actions (EIP-712), sends them over REST POST /exchange,
 //     parses receipts, and keeps a durable pending journal so
 //     that a request with an unknown outcome is reconciled by order ID or client
@@ -16,7 +17,8 @@
 //   - Errors: *ActionRejectedError (the whole action was refused, final),
 //     *PartialExecutionError (some legs ran, some were rejected or wait),
 //     *RateLimitError (HTTP 429) and *UnknownOutcomeError (it may or may not
-//     have executed; reconcile it).
+//     have executed; reconcile it). A request quota rejection (code 1800) is a
+//     final rejection: IsQuotaRejection(err) tells it from the others.
 //
 // # Trading
 //
@@ -70,6 +72,33 @@
 // unresolved: recovery accepts an order found by cloid only if it was created
 // after the request was journaled and has the submitted side, price and size;
 // otherwise the request stays pending.
+//
+// # Request quota
+//
+// An account may send 10000 + 1 per USD traded requests in total (cancels
+// have a higher cap); purchased requests add to it. InfoClient.UserRateLimit
+// reports it and UserRateLimit.Remaining counts what is left. A request over the
+// cap is rejected with code 1800 ("Too many cumulative requests sent"): a
+// final rejection, never an unknown outcome, matched by IsQuotaRejection (and
+// errors.Is with ErrRequestQuotaExceeded) on the whole-action rejection and on
+// every rejected leg. An action can be partly accepted: the first legs run and
+// every later leg carries the quota error. The SDK never retries or buys on its
+// own; back off (one unit per 10 seconds is still accepted), trade, or buy:
+//
+//	err = client.Exchange(ctx, exchange.NewReserveRequestWeight(100000)) // 50 USDC
+//
+// A purchase has no legs and no order to look up. If its outcome is unknown it
+// stays in the journal, RecoverPending never resends it and reports
+// ErrPurchaseUnresolved: compare UserRateLimit (surplus and used) before and
+// after, then call AcknowledgePendingPurchase.
+//
+// # Gateway credential
+//
+// RiverBit can issue a market maker a gateway credential that lifts the per-IP
+// REST limits. Client.SetGatewayCredential and InfoClient.SetGatewayCredential
+// make every REST request carry the header X-RiverBit-MM-Token. It is optional,
+// never sent over bin-ws or to another URL, and never logged, journaled or put
+// in an error message.
 //
 // The package never logs private keys or complete signed requests.
 package exchange
