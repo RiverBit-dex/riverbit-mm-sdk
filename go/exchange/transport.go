@@ -14,6 +14,10 @@ import (
 // ActionTransport submits signed /exchange request bodies over a long-lived
 // connection. *binws.Session implements it: the body goes out as action_json
 // with an incrementing frame id and the reply is matched by that id.
+//
+// The public RiverBit /bin-ws endpoint does not accept action_json (it answers
+// 504 Gateway Timeout); order entry there is REST POST /exchange only. Any error
+// from PostAction, including an error reply, is an unknown outcome.
 type ActionTransport interface {
 	// URL identifies the transport in durable request journals.
 	URL() string

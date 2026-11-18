@@ -10,7 +10,11 @@ use crate::receipt::{interpret, Receipt};
 use crate::signing::{ActionInfo, Address, SignedRequest, Signer, SigningDomain};
 use crate::transport::{ActionTransport, Rest, RestActions, TransportError};
 
-/// Signs trading actions and submits them over REST (default) or bin-ws.
+/// Signs trading actions and submits them over REST (default).
+///
+/// Send orders over REST: the public bin-ws endpoint does not accept
+/// `action_json`. A [`BinWsSession`](crate::BinWsSession) can still be used as
+/// the transport for an endpoint that does.
 ///
 /// A request is signed once. The bytes of the [`SignedRequest`] are the bytes
 /// that go on the wire, on either transport. If a send ends without a usable
@@ -32,7 +36,9 @@ impl ExchangeClient {
         Self::with_http_client(base_url, signer, domain, None)
     }
 
-    /// Like [`new`](Self::new) with your own `reqwest` client.
+    /// Like [`new`](Self::new) with your own `reqwest` client. Build it with
+    /// `redirect(reqwest::redirect::Policy::none())`: a signed POST must never
+    /// be replayed to a redirect target. The default client already does this.
     pub fn with_http_client(
         base_url: &str,
         signer: Signer,
@@ -48,8 +54,9 @@ impl ExchangeClient {
         Ok(Self::with_transport(transport, signer, domain))
     }
 
-    /// A client over any [`ActionTransport`], for example a
-    /// [`BinWsSession`](crate::BinWsSession).
+    /// A client over any [`ActionTransport`]. A
+    /// [`BinWsSession`](crate::BinWsSession) works only against an endpoint
+    /// that accepts `action_json`; the public `/bin-ws` endpoint does not.
     pub fn with_transport(
         transport: Arc<dyn ActionTransport>,
         signer: Signer,
@@ -81,7 +88,10 @@ impl ExchangeClient {
         self
     }
 
-    /// Bounds one submission. Running out of time is an unknown outcome.
+    /// Bounds one submission. Running out of time is an unknown outcome, even
+    /// if the request was never written: only a transport's own, shorter
+    /// timeout (see `BinWsConfig::request_timeout`) can prove that, and then
+    /// the error is [`Error::NotSent`].
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -138,6 +148,10 @@ impl ExchangeClient {
                 TransportError::Timeout => unknown(UnknownReason::Timeout, None),
                 TransportError::Disconnected(m) => unknown(UnknownReason::Disconnected(m), None),
                 TransportError::SendFailed(m) => unknown(UnknownReason::SendFailed(m), None),
+                TransportError::NotSent(reason) => Error::NotSent {
+                    request: Box::new(request.clone()),
+                    reason,
+                },
                 TransportError::Status {
                     status: 429,
                     body,

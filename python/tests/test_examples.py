@@ -42,8 +42,13 @@ def ok_reply(statuses: list[Any]) -> httpx.Response:
     return httpx.Response(200, json={"status": "ok", "response": {"data": {"statuses": statuses}}})
 
 
-def fake_api() -> tuple[httpx.AsyncClient, list[dict[str, Any]]]:
-    """A fake REST API that places, finds and cancels orders."""
+def fake_api(
+    batch_modify_statuses: list[Any] | None = None,
+) -> tuple[httpx.AsyncClient, list[dict[str, Any]]]:
+    """A fake REST API that places, finds and cancels orders.
+
+    ``batch_modify_statuses`` replaces the statuses answered to a ``batchModify``.
+    """
     seen: list[dict[str, Any]] = []
     meta = [{"universe": [{"name": "RBT", "szDecimals": 2}, {"name": "BTC", "szDecimals": 5}]}, []]
     oids = iter(range(100, 200))
@@ -89,6 +94,8 @@ def fake_api() -> tuple[httpx.AsyncClient, list[dict[str, Any]]]:
             state.setdefault("canceled", set()).update(
                 state["cloids"][c["cloid"]] for c in action["cancels"]
             )
+        if action["type"] == "batchModify" and batch_modify_statuses is not None:
+            return ok_reply(batch_modify_statuses)
         if action["type"] == "batchModify":
             legs = []
             for item in action["modifies"]:
@@ -126,6 +133,20 @@ async def test_batch_modify_example(capsys: pytest.CaptureFixture[str]) -> None:
     assert actions == ["order", "batchModify", "cancel"]
     cancel = [s for s in seen if s["path"] == "/exchange"][2]["body"]["action"]
     assert [c["o"] for c in cancel["cancels"]] == [102, 103]
+
+
+async def test_batch_modify_example_cancels_every_old_order_on_a_short_receipt(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mod = load("batch_modify")
+    client, seen = fake_api([{"error": "PrecisionExceeded"}])  # one status for two modifies
+    await mod.run(config(), "BTC", "50000", "51000", "0.001", http_client=client)
+    out = capsys.readouterr().out
+    assert "receipt has 1 leg(s) for 2 modifies" in out
+    exchange = [s["body"]["action"] for s in seen if s["path"] == "/exchange"]
+    assert [a["type"] for a in exchange] == ["order", "batchModify", "cancel", "cancelByCloid"]
+    assert [c["o"] for c in exchange[2]["cancels"]] == [100, 101]  # both old orders
+    assert len(exchange[3]["cancels"]) == 2  # and the replacements, by cloid
 
 
 async def test_stream_example(capsys: pytest.CaptureFixture[str]) -> None:
@@ -166,3 +187,32 @@ async def test_reconcile_example(capsys: pytest.CaptureFixture[str]) -> None:
     out = capsys.readouterr().out
     assert "disconnected" in out and "open orders after reconnect: 0" in out
     assert len(server.logins) == 2
+
+
+async def test_reconcile_example_keeps_a_cancel_pending(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from riverbit_mm import Cloid, InfoClient
+    from riverbit_mm.actions import CancelByCloid, CancelByCloidItem
+
+    mod = load("reconcile_after_reconnect")
+    cloid = Cloid.from_int(7)
+    canceled = {
+        "status": "order",
+        "height": 9,
+        "order": {"status": "canceled", "order": {"oid": 5}},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=canceled)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    request = Signer("0x" + "01" * 32).sign_action(
+        CancelByCloid([CancelByCloidItem(1, cloid)]).to_json(), 1000, chain_id=1
+    )
+    pending = {request.nonce: request}
+    async with InfoClient("https://api.example.test", http_client=http) as info:
+        await mod.recover(info, MASTER, pending)
+    out = capsys.readouterr().out
+    assert pending == {1000: request}  # kept: the target is terminal but the request is not final
+    assert "request unconfirmed" in out and str(cloid) in out

@@ -11,6 +11,10 @@ What is left to the application, and what this example does on each
 3. reconcile every request whose outcome is still unknown, by oid or cloid,
 4. only then process the buffered pushes.
 
+A cancel request stays pending even when its target is already terminal: order
+state cannot show that the request itself has finished, and a cloid must not be
+reused while any request naming it is unresolved.
+
 ``pending`` stands in for your own journal of requests that were sent but not
 confirmed. The SDK does not persist it for you (see the README); a production
 maker writes it to durable storage before sending.
@@ -44,8 +48,15 @@ async def recover(info: InfoClient, account: str, pending: dict[int, SignedReque
     for nonce, request in list(pending.items()):
         result = await wait_reconciled(info, account, request, timeout=30)
         if result.resolved:
-            print(f"request {nonce} resolved: {[s.status for s in result.placed + result.cancels]}")
+            print(f"request {nonce} resolved: {[s.status for s in result.placed]}")
             del pending[nonce]
+        elif result.targets_settled:
+            # A cancel whose target is terminal is still pending: the target may have ended
+            # for another reason while this request is in flight, and a late cancelByCloid
+            # would cancel a new order that reused the cloid. Keep it, and keep its cloids
+            # out of use (the best rule is never to reuse a cloid).
+            print(f"request {nonce} target is terminal, request unconfirmed: keep it pending")
+            print(f"  cloids on hold: {list(result.hold_cloids)}")
         else:
             # Unresolved is not "failed": keep it pending and keep conflicting writes on hold.
             print(f"request {nonce} still unresolved: {result.unresolved}")

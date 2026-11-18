@@ -1,8 +1,11 @@
 //! Transports: how signed actions and info queries reach the exchange.
 //!
-//! REST is the default. A logged-in [`BinWsSession`](crate::BinWsSession)
-//! implements both traits, so the same signed bytes can go out as
-//! `action_json` instead of `POST /exchange`.
+//! REST is the default and the way to send orders: `POST /exchange`. A
+//! logged-in [`BinWsSession`](crate::BinWsSession) also implements both traits,
+//! but the public `/bin-ws` endpoint does not accept `action_json` (the server
+//! replies `504 Gateway Timeout`); it serves market data, order and fill events
+//! and `info_json` queries. The bin-ws action transport is kept for endpoints
+//! that do accept it.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -22,6 +25,9 @@ pub enum TransportError {
     Disconnected(String),
     /// The request could not be written (no connection, connect failure).
     SendFailed(String),
+    /// The request was provably never written, so it cannot have executed.
+    /// Only a transport that can prove this reports it.
+    NotSent(String),
     /// A non-success HTTP status.
     Status {
         /// The status code.
@@ -93,9 +99,13 @@ impl Rest {
     ) -> Result<Self, crate::error::Error> {
         let http = match http {
             Some(c) => c,
+            // Never follow a redirect: a signed POST that is replayed to
+            // another location has an unknown outcome. A 3xx is returned to
+            // the caller as a non-200 status.
             None => reqwest::Client::builder()
                 .user_agent(concat!("riverbit-mm-sdk-rust/", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| crate::error::Error::Transport(format!("build HTTP client: {e}")))?,
         };
@@ -112,15 +122,25 @@ impl Rest {
         body: &[u8],
         timeout: Duration,
     ) -> Result<RestReply, TransportError> {
+        let url = format!("{}{path}", self.base);
         let response = self
             .http
-            .post(format!("{}{path}", self.base))
+            .post(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .timeout(timeout)
             .body(body.to_vec())
             .send()
             .await
             .map_err(map_reqwest)?;
+        // A caller-supplied client may follow redirects. The body is already
+        // gone then; refuse to treat the answer as the answer of this URL.
+        let sent_to =
+            reqwest::Url::parse(&url).map_err(|e| TransportError::SendFailed(e.to_string()))?;
+        if *response.url() != sent_to {
+            return Err(TransportError::Other(
+                "the request was redirected; the HTTP client must not follow redirects".into(),
+            ));
+        }
         let status = response.status().as_u16();
         let retry_after = response
             .headers()

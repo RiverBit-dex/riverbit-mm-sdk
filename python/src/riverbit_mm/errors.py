@@ -71,8 +71,11 @@ class ActionRejected(RiverBitError):
 class UnknownOutcome(RiverBitError):
     """The action may or may not have executed.
 
-    Raised on a timeout, a disconnect, a non-200 answer, a malformed reply, or a
-    reply that asks the caller to query before deciding.
+    Raised on a timeout, a disconnect, a non-200 answer, a malformed or incomplete
+    reply (including one whose statuses do not match the legs sent, or any bin-ws
+    reply that cannot be read after the request was written), a duplicate nonce
+    (code 205: the first request with that nonce may have executed), or a reply
+    that asks the caller to query before deciding.
 
     Carries what is needed to reconcile: ``nonce`` and ``request``, the signed
     request (``request.body`` holds the exact bytes that were sent). **Never

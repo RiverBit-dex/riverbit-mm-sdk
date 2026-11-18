@@ -84,7 +84,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`ExchangeClient` fetches `nextAgentChainId` from `chainIdentity` once, allocates nonces, signs, sends the bytes it signed and parses the receipt. To stream market data and keep a local book:
+`ExchangeClient` fetches `nextAgentChainId` from `chainIdentity` once, allocates nonces, signs, sends the bytes it signed with `POST /exchange` and parses the receipt. **Send orders over REST**: the public `/bin-ws` endpoint does not accept `action_json` (the server replies `504 Gateway Timeout`), so do not pass `ws=` to `ExchangeClient` there. bin-ws is for market data, order and fill events and `info_json` queries. To stream market data and keep a local book:
 
 ```python
 from riverbit_mm import BinWsSession, Book, Connected, ServerFrame, subscriptions
@@ -122,7 +122,8 @@ The examples read the key from the file named by `RIVERBIT_KEY_FILE` and the end
 | Actions: `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`, `Cloid` | Yes | Fixed field order; prices and sizes must be decimal strings |
 | REST `/info` client | Yes | `chainIdentity`, `userRole`, `leadingVaults`, `metaAndAssetCtxs`, `l2Book`, `openOrders`, `frontendOpenOrders`, `orderStatus`, `userFills`, `clearinghouseState`, `candleSnapshot`, plus `query()` for any other type; `Retry-After` honoured on 429 |
 | REST `/exchange` client | Yes | Per-leg receipts; rejection, rate limit and unknown outcome are distinct |
-| bin-ws session | Yes | Login as the first frame, subscribe/unsubscribe, ping, id-matched `action_json` / `info_json`, reconnect with login and resubscribe |
+| bin-ws session | Yes | Login as the first frame, subscribe/unsubscribe, ping, id-matched `info_json` (and `action_json`, see below), reconnect with login and resubscribe |
+| Order entry over bin-ws (`ExchangeClient(ws=...)`) | **Not on the public endpoint** | The public `/bin-ws` does not accept `action_json` (it answers `504 Gateway Timeout`). Order entry is REST `POST /exchange` only; the option is kept for endpoints that accept actions |
 | Typed frames | Yes | `l2` (snapshot and update), `l2Book`, `bbo`, `trades`, `candle`; every other stream, and the JSON fallback of typed streams, as `JsonFrame` |
 | Local order book | Yes | Replays `l2` snapshots and updates (typed and JSON fallback) per guide section 5 |
 | Nonce source | Yes | Millisecond timestamps, strictly increasing under concurrency, shared per signer in a process |
@@ -150,7 +151,7 @@ Place([Order(asset=1, is_buy=True, price="80000", size="0.001", tif="Alo", cloid
 **Clients**
 
 - `InfoClient(base_url)`: one coroutine per query type, `assets()` (parsed `universe`), `next_agent_chain_id()`, and `query(body)` for anything else.
-- `ExchangeClient(base_url, signer, chain_id=None, vault_address=None, ws=None)`: `post(action)` (sign with a fresh nonce and send once), `prepare(action)` / `sign(action)` (sign only, so you can persist the request first), `submit(signed_request)`, and shortcuts `place`, `cancel`, `cancel_by_cloid`, `modify`, `batch_modify`. With `ws=session`, actions travel as `action_json` over bin-ws; the bytes are identical to REST.
+- `ExchangeClient(base_url, signer, chain_id=None, vault_address=None, ws=None)`: `post(action)` (sign with a fresh nonce and send once), `prepare(action)` / `sign(action)` (sign only, so you can persist the request first), `submit(signed_request)`, and shortcuts `place`, `cancel`, `cancel_by_cloid`, `modify`, `batch_modify`. Actions go out with `POST /exchange`. `ws=session` sends them as `action_json` over bin-ws with identical bytes, but the public `/bin-ws` endpoint rejects `action_json` (`504 Gateway Timeout`): use REST for orders.
 - `BinWsSession(url, login_host, signer)`: `start()` / `close()` (or `async with`), `subscribe` / `unsubscribe` (recorded and re-sent after a reconnect), `ping`, `post_action`, `post_info`, `query` (unwraps `data`, retries a 429 reply), `frames()` (async iterator), `user`, `signer_address`.
 - `riverbit_mm.subscriptions`: builders for `l2`, `l2_book`, `bbo`, `trades`, `candle`, `order_updates`, `user_fills`, `open_orders`, `clearinghouse_state`.
 
@@ -160,20 +161,20 @@ Place([Order(asset=1, is_buy=True, price="80000", size="0.001", tif="Alo", cloid
 - Typed prices and sizes are integers divided by `10 ** decimals`; `format_fixed(value, decimals)` renders them exactly (`format_fixed(1010, 1) == "101.0"`).
 - `Book(coin).apply(body)` accepts typed `l2` frames and the JSON fallback. It raises `BookError` and leaves the book untouched if a frame cannot be applied (gap, changed decimals): `reset()` it and resubscribe.
 
-**Receipts**: `exchange.post(...)` returns a `Receipt` with `legs` (one `Leg` per `statuses[]` entry: `kind` is `resting`, `filled`, `success`, `waitingForTrigger`, `waitingForFill`, `error` or `unknown`; `oid`, `total_sz`, `avg_px`, `error`), `failed`, `all_ok`, `complete` and `acknowledged` (the bare `{"type":"default"}` answer to a single `modify`). A rejected **leg** does not raise: partial success is not rolled back, so inspect every leg and never replay the whole action.
+**Receipts**: `exchange.post(...)` returns a `Receipt` with `legs` (one `Leg` per `statuses[]` entry: `kind` is `resting`, `filled`, `success`, `waitingForTrigger`, `waitingForFill`, `error` or `unknown`; `oid`, `total_sz`, `avg_px`, `error`), `failed`, `all_ok`, `complete` and `acknowledged` (the bare `{"type":"default"}` answer to a single `modify`). A receipt is only returned for a well-formed answer: statuses that do not match the legs sent (except the single `PrecisionExceeded` status of a multi-leg action, where `complete` is false), or a leg that is malformed or lacks its oid, raise `UnknownOutcome`. A rejected **leg** does not raise: partial success is not rolled back, so inspect every leg and never replay the whole action.
 
 ## Errors and unknown outcomes
 
 | Exception | Meaning | What to do |
 |---|---|---|
-| `ActionRejected` | The node rejected the whole action (`.code`, for example 91, 1160, 203, 204, 205, 97). Nothing executed. | Fix the cause, then build a **new** action. The nonce is spent. |
+| `ActionRejected` | The node rejected the whole action (`.code`, for example 91, 1160, 203, 204, 97). Nothing executed. | Fix the cause, then build a **new** action. The nonce is spent. |
 | `RateLimited` | A read was throttled and the retries ran out (`.retry_after`). | Back off. Read clients already retry after `Retry-After`. |
-| `UnknownOutcome` | A write may or may not have executed: timeout, disconnect, non-200 (including 429 and 5xx), malformed reply, or a reply that asks you to query first (`action already pending`, `localCommitted`, ...). Carries `.nonce`, `.request` and `.request_body`. | **Never re-sign it under a new nonce.** Reconcile with `reconcile_unknown` / `wait_reconciled`, and hold conflicting writes until it resolves. |
+| `UnknownOutcome` | A write may or may not have executed: timeout, disconnect, non-200 (including 429 and 5xx), malformed or incomplete reply (statuses that do not match the legs sent, a leg without its oid), a duplicate nonce (code 205: the first request with that nonce may have executed), or a reply that asks you to query first (`action already pending`, `localCommitted`, ...). Carries `.nonce`, `.request` and `.request_body`. | **Never re-sign it under a new nonce.** Reconcile with `reconcile_unknown` / `wait_reconciled`, and hold conflicting writes until it resolves. |
 | `NotSent` | The bin-ws session was not connected, so nothing was written. | The same `SignedRequest` may be submitted again. |
 
 A 429 on a write is deliberately reported as `UnknownOutcome`, not `RateLimited`: an HTTP status alone does not prove non-execution, and the SDK never retries a write.
 
-`reconcile_unknown(info, account, outcome)` reads `orderStatus` for every oid and cloid the request touches and returns a `Reconciliation`: `resolved` is true only with positive evidence (a placement is found by cloid; a cancellation target is a current order in a terminal state). `unknownOid`, an empty `openOrders` and elapsed time are never treated as proof. **Give every order a cloid**, otherwise it cannot be looked up. `account` is the master address, or the vault address when trading for a vault. `info` can be an `InfoClient` or a `BinWsSession`.
+`reconcile_unknown(info, account, outcome)` reads `orderStatus` for every oid and cloid the request touches and returns a `Reconciliation`: `targets_settled` is true with positive evidence about what the request names (a placement is found by cloid; a cancellation target is a current order in a terminal state), and `request_final` is true only when the request itself is shown to have run; `resolved` needs both. A **cancel request is never resolved by its target's state**: the target may have ended for another reason while the cancel is still in flight, and a late `cancelByCloid` would cancel a new order that reuses the cloid. Keep such a request pending, and do not reuse a cloid while any request naming it is unresolved (`hold_cloids` lists them; the safest rule is never to reuse one). `unknownOid`, an empty `openOrders` and elapsed time are never treated as proof. **Give every order a cloid**, otherwise it cannot be looked up. `account` is the master address, or the vault address when trading for a vault. `info` can be an `InfoClient` or a `BinWsSession`.
 
 ### Pending-request journal (not in v0.1)
 

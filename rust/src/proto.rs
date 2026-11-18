@@ -190,8 +190,9 @@ fn put_packed32(out: &mut Vec<u8>, field: u32, values: &[u32]) {
 
 // ---------------------------------------------------------------- login
 
-/// `WsV2Login`: the first frame on every connection.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// `WsV2Login`: the first frame on every connection. `Debug` does not print
+/// the signature.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Login {
     /// Milliseconds since the epoch; within plus or minus 30 seconds of server time.
     pub timestamp_ms: u64,
@@ -199,6 +200,14 @@ pub struct Login {
     pub nonce: Vec<u8>,
     /// 65 bytes `r || s || v`.
     pub signature: Vec<u8>,
+}
+
+impl std::fmt::Debug for Login {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Login")
+            .field("timestamp_ms", &self.timestamp_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Login {

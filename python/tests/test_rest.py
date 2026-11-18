@@ -260,7 +260,7 @@ async def test_per_leg_statuses_do_not_raise() -> None:
                     {"filled": {"totalSz": "0.2", "avgPx": "100.5", "oid": 12}},
                     {"error": "Post only order would have immediately matched"},
                     {"waitingForTrigger": {}},
-                    "weird",
+                    {"waitingForFill": {}},
                 ]
             },
         },
@@ -268,12 +268,93 @@ async def test_per_leg_statuses_do_not_raise() -> None:
     client = exchange_for(Recorder(jr(reply)))
     receipt = await client.place([ORDER] * 5)
     assert [leg.kind for leg in receipt.legs] == [
-        "resting", "filled", "error", "waitingForTrigger", "unknown",
+        "resting", "filled", "error", "waitingForTrigger", "waitingForFill",
     ]  # fmt: skip
     assert receipt.legs[1].total_sz == "0.2" and receipt.legs[1].avg_px == "100.5"
     assert receipt.legs[2].error and not receipt.legs[2].ok
-    assert [leg.index for leg in receipt.failed] == [2, 4]
+    assert [leg.index for leg in receipt.failed] == [2]
     assert not receipt.all_ok and receipt.complete
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "action rejected by execution (code 205): duplicate nonce",
+        "duplicate nonce",
+        "action already pending",
+    ],
+)
+async def test_duplicate_nonce_is_an_unknown_outcome(response: str) -> None:
+    client = exchange_for(Recorder(jr({"status": "err", "response": response})))
+    request = client.sign(Place([ORDER]))
+    with pytest.raises(UnknownOutcome) as err:
+        await client.submit(request)
+    assert err.value.nonce == request.nonce and err.value.request_body == request.body
+
+
+@pytest.mark.parametrize(
+    "statuses",
+    [
+        [{"filled": {}}],
+        [{"filled": {"totalSz": "0.2", "avgPx": "100.5"}}],
+        [{"resting": {}}],
+        [{"resting": {"oid": 0}}],
+        [{"resting": {"oid": True}}],
+        ["weird"],
+        [{"resting": {"oid": 1}}, {"resting": {"oid": 2}}],  # more statuses than legs
+    ],
+)
+async def test_malformed_or_miscounted_receipts_are_unknown(statuses: list[Any]) -> None:
+    reply = {"status": "ok", "response": {"data": {"statuses": statuses}}}
+    with pytest.raises(UnknownOutcome):
+        await exchange_for(Recorder(jr(reply))).place([ORDER])
+
+
+async def test_short_receipt_is_unknown_not_success_or_rejection() -> None:
+    reply = {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}}
+    client = exchange_for(Recorder(jr(reply)))
+    request = client.sign(Place([ORDER, ORDER, ORDER]))
+    with pytest.raises(UnknownOutcome) as err:
+        await client.submit(request)
+    assert err.value.request is request
+    # the same holds for an error reply that carries a committedResult
+    committed = {
+        "status": "err",
+        "response": "partially applied",
+        "committedResult": {"data": {"statuses": [{"resting": {"oid": 9}}]}},
+    }
+    with pytest.raises(UnknownOutcome):
+        await exchange_for(Recorder(jr(committed))).place([ORDER, ORDER])
+    # a single-leg action with a precision error is an ordinary rejected leg
+    single = {"status": "ok", "response": {"data": {"statuses": [{"error": "PrecisionExceeded"}]}}}
+    receipt = await exchange_for(Recorder(jr(single))).place([ORDER])
+    assert receipt.complete and not receipt.all_ok and receipt.failed
+
+
+def test_signed_request_repr_hides_signature_and_body() -> None:
+    signer = Signer("0x" + "01" * 32)
+    request = signer.sign_action(Place([ORDER]).to_json(), 1_792_168_694_973, chain_id=12589)
+    for text in (repr(request), str(request)):
+        assert "1792168694973" in text and "'order'" in text and signer.address_lower in text
+        assert request.signature.r not in text and request.signature.s not in text
+        assert "signature" not in text and "action_json" not in text and "body" not in text
+        assert request.body.decode() not in text and request.action_json.decode() not in text
+    assert request.signer_address == signer.address_lower
+    assert request.body.startswith(b'{"action":')  # the bytes stay available
+
+
+async def test_receipt_and_unknown_outcome_do_not_leak_the_request() -> None:
+    reply = {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 77}}]}}}
+    client = exchange_for(Recorder(jr(reply)))
+    request = client.sign(Place([ORDER]))
+    receipt = await client.submit(request)
+    outcome = UnknownOutcome("timeout", request=request, transport="rest")
+    rejected = ActionRejected("no", code=91, nonce=request.nonce, request=request)
+    for obj in (receipt, outcome, rejected):
+        for text in (repr(obj), str(obj)):
+            assert request.signature.r not in text and request.signature.s not in text
+            assert request.body.decode() not in text
+    assert outcome.request_body == request.body  # still available explicitly
 
 
 async def test_single_precision_status_is_flagged_incomplete() -> None:

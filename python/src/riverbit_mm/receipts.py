@@ -23,8 +23,12 @@ _AMBIGUOUS_HINTS = (
     "waiting for its trigger",
     "not verified",
     "already pending",
+    "duplicate nonce",
     "localcommitted",
 )
+# Execution codes that say the nonce was seen before: the first request with it may
+# have executed, so the answer settles nothing about it.
+_UNSETTLED_CODES = frozenset({205})
 _CODE_RE = re.compile(r"action rejected by execution \(code (\d+)\)")
 
 
@@ -50,7 +54,8 @@ class Leg:
 class Receipt:
     """What the node answered for one request that it did process.
 
-    ``legs`` has one entry per ``statuses[]`` item, in action order. A leg that
+    ``legs`` has one entry per ``statuses[]`` item, in action order, and is only built
+    from a well-formed answer (see :func:`interpret_reply`). A leg that
     was rejected does not raise: inspect :attr:`failed`. Partial success is not
     rolled back, so never replay the whole action.
 
@@ -102,10 +107,14 @@ def parse_leg(index: int, raw: Any) -> Leg:
             return Leg(index, "error", error=value, raw=raw)
         if key in ("resting", "filled") and isinstance(value, dict):
             oid = value.get("oid")
+            if not isinstance(oid, int) or isinstance(oid, bool) or oid <= 0:
+                # An accepted leg always names its order: without an oid the leg is
+                # malformed and says nothing about what happened.
+                return Leg(index, "unknown", raw=raw)
             return Leg(
                 index,
                 key,
-                oid=oid if isinstance(oid, int) and not isinstance(oid, bool) else None,
+                oid=oid,
                 total_sz=value.get("totalSz") if key == "filled" else None,
                 avg_px=value.get("avgPx") if key == "filled" else None,
                 raw=raw,
@@ -123,6 +132,15 @@ def _statuses(container: Any) -> list[Any] | None:
     return statuses if isinstance(statuses, list) and statuses else None
 
 
+def _is_precision_exceeded(statuses: list[Any]) -> bool:
+    """The documented single-status answer that gave no leg an oid."""
+    if len(statuses) != 1:
+        return False
+    only = statuses[0]
+    error = only.get("error") if isinstance(only, dict) and len(only) == 1 else None
+    return isinstance(error, str) and "PrecisionExceeded" in error
+
+
 def interpret_reply(
     result: Any,
     *,
@@ -134,7 +152,10 @@ def interpret_reply(
     """Turn a decoded ``/exchange`` answer into a :class:`Receipt`.
 
     Raises :class:`ActionRejected` for a deterministic whole-action rejection and
-    :class:`UnknownOutcome` for any answer that does not settle the outcome.
+    :class:`UnknownOutcome` for any answer that does not settle the outcome: a
+    duplicate nonce (code 205) or ``action already pending``, a receipt with a
+    different number of statuses than the action has legs (except the lone
+    ``PrecisionExceeded`` status), or a leg that is malformed or lacks its oid.
     """
 
     def unknown(reason: str) -> UnknownOutcome:
@@ -145,11 +166,30 @@ def interpret_reply(
     status = result.get("status")
     response = result.get("response")
 
+    def legs_of(statuses: list[Any]) -> tuple[Leg, ...]:
+        """Parse the legs, or raise unless the receipt is complete and well formed.
+
+        A receipt whose statuses do not line up with the legs of the action, or that
+        has a leg that cannot be read, settles nothing: it is neither a success nor
+        a rejection. The one documented exception is a lone ``PrecisionExceeded``
+        status for a multi-leg action, which means no leg was given an oid.
+        """
+        legs = tuple(parse_leg(i, s) for i, s in enumerate(statuses))
+        if len(legs) != expected_legs:
+            if expected_legs > 1 and _is_precision_exceeded(statuses):
+                return legs
+            raise unknown(
+                f"receipt has {len(legs)} status(es) for {expected_legs} leg(s) of the action"
+            )
+        bad = [leg.index for leg in legs if leg.kind == "unknown"]
+        if bad:
+            raise unknown(f"receipt leg(s) {bad} are malformed or carry no oid")
+        return legs
+
     if status == "ok":
         statuses = _statuses(response)
         if statuses is not None:
-            legs = tuple(parse_leg(i, s) for i, s in enumerate(statuses))
-            return Receipt("ok", request, legs, expected_legs, False, result)
+            return Receipt("ok", request, legs_of(statuses), expected_legs, False, result)
         if action_type in ("modify", "batchModify") and response == {"type": "default"}:
             return Receipt("ok", request, (), expected_legs, True, result)
         raise unknown("accepted reply without statuses")
@@ -160,16 +200,18 @@ def interpret_reply(
             statuses = _statuses(committed)
             if statuses is None:
                 raise unknown("error reply with an unparseable committedResult")
-            legs = tuple(parse_leg(i, s) for i, s in enumerate(statuses))
-            return Receipt("err", request, legs, expected_legs, False, result)
+            return Receipt("err", request, legs_of(statuses), expected_legs, False, result)
         text = response if isinstance(response, str) else json.dumps(response)
         lowered = (text + json.dumps(result)).lower()
         if any(hint in lowered for hint in _AMBIGUOUS_HINTS):
             raise unknown(f"node asks to query before deciding: {text[:300]}")
         match = _CODE_RE.search(text)
+        code = int(match.group(1)) if match else None
+        if code in _UNSETTLED_CODES:
+            raise unknown(f"duplicate nonce (code {code}): the original request may have executed")
         raise ActionRejected(
             text[:500],
-            code=int(match.group(1)) if match else None,
+            code=code,
             nonce=request.nonce,
             response=response,
             request=request,

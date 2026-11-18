@@ -17,6 +17,7 @@ import httpx
 from _common import Config, load_config
 from riverbit_mm import (
     BatchModify,
+    CancelByCloidItem,
     CancelItem,
     Cloid,
     ExchangeClient,
@@ -78,19 +79,33 @@ async def run(
         except UnknownOutcome as exc:
             print(f"batchModify outcome unknown (nonce {exc.nonce}); reconcile, do not resend")
             return
-        for old, leg in zip(live.values(), modified.legs, strict=False):
-            if leg.ok:
-                print(f"oid {old} -> {leg.oid}")
-            else:
-                print(f"oid {old} not replaced: {leg.error}")
-        new_oids = [leg.oid for leg in modified.legs if leg.ok and leg.oid]
-        old_oids = [
-            old for old, leg in zip(live.values(), modified.legs, strict=False) if not leg.ok
-        ]
-        remaining = new_oids + old_oids
+        # Account for every old oid explicitly; never pair oids and legs by truncation.
+        old_oids = [live[0], live[1]]  # in the order of the modifies sent
+        remaining: list[int] = []
+        by_cloid = False
+        if len(modified.legs) != len(old_oids):
+            # Fewer legs than modifies (for example the single PrecisionExceeded status, which
+            # gives no leg an oid) or a bare acknowledgement: nothing is confirmed, so treat
+            # every old order as still live, and the replacements, which cannot be named by
+            # oid here, as possibly live under their cloids.
+            print(f"receipt has {len(modified.legs)} leg(s) for {len(old_oids)} modifies")
+            remaining = list(old_oids)
+            by_cloid = True
+        else:
+            for old, leg in zip(old_oids, modified.legs, strict=True):
+                if leg.ok and leg.oid:
+                    print(f"oid {old} -> {leg.oid}")
+                    remaining.append(leg.oid)
+                else:
+                    print(f"oid {old} not replaced: {leg.error or leg.kind}")
+                    remaining.append(old)
         if remaining:
             cancel = await exchange.cancel([CancelItem(asset.index, oid) for oid in remaining])
             print(f"cancel legs: {[leg.kind for leg in cancel.legs]}")
+        if by_cloid:
+            items = [CancelByCloidItem(asset.index, c) for c in (buy_cloid, sell_cloid)]
+            by_cloid_receipt = await exchange.cancel_by_cloid(items)
+            print(f"cancel by cloid legs: {[leg.kind for leg in by_cloid_receipt.legs]}")
 
 
 async def main(argv: list[str] | None = None) -> None:

@@ -107,8 +107,13 @@ func TestMixedBatchReceiptSurvivesRestart(t *testing.T) {
 				ctx, cancel = context.WithTimeout(context.Background(), time.Second)
 				err = fresh.RecoverPending(ctx)
 				cancel()
-				if !errors.Is(err, ErrExecutionRejected) || !strings.Contains(err.Error(), "Order was never placed") {
-					t.Fatalf("partial batch must report rejection: %v", err)
+				var partial *PartialExecutionError
+				if errors.Is(err, ErrExecutionRejected) || !errors.As(err, &partial) || !strings.Contains(err.Error(), "Order was never placed") {
+					t.Fatalf("a partly rejected batch must be a partial execution, not a whole rejection: %v", err)
+				}
+				if len(partial.Executed) != 1 || partial.Executed[0].Index != 0 || partial.Executed[0].OID != 101 ||
+					len(partial.Rejected) != 1 || partial.Rejected[0].Index != 1 || !strings.Contains(partial.Rejected[0].Error, "Order was never placed") {
+					t.Fatalf("per-leg result = %+v", partial)
 				}
 				if sends.Load() != 1 || len(fresh.LastOrderIDs) != 1 || fresh.LastOrderIDs[0] != 101 || fresh.LastExecutionHeight != 10 {
 					t.Fatalf("sends=%d ids=%v height=%d", sends.Load(), fresh.LastOrderIDs, fresh.LastExecutionHeight)
@@ -129,6 +134,8 @@ func TestRecoveryKeepsPositiveEvidenceAcrossRestart(t *testing.T) {
 	var sends, firstReads atomic.Int32
 	var visible atomic.Bool
 	first, second := "0x"+strings.Repeat("1", 32), "0x"+strings.Repeat("2", 32)
+	a, b := alo("100"), alo("99")
+	a.Cloid, b.Cloid = first, second
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/exchange" {
 			sends.Add(1)
@@ -145,7 +152,7 @@ func TestRecoveryKeepsPositiveEvidenceAcrossRestart(t *testing.T) {
 				fmt.Fprint(w, `{"height":11,"status":"unknownOid"}`)
 				return
 			}
-			fmt.Fprint(w, `{"height":10,"status":"order","order":{"status":"filled","order":{"oid":101}}}`)
+			fmt.Fprint(w, orderStatusBody(10, "filled", 101, a))
 			return
 		}
 		if q.OID != second {
@@ -155,11 +162,10 @@ func TestRecoveryKeepsPositiveEvidenceAcrossRestart(t *testing.T) {
 			fmt.Fprint(w, `{"height":11,"status":"unknownOid"}`)
 			return
 		}
-		fmt.Fprint(w, `{"height":11,"status":"order","order":{"status":"filled","order":{"oid":102}}}`)
+		fmt.Fprint(w, orderStatusBody(11, "filled", 102, b))
 	}))
 	defer server.Close()
 	c.URL = server.URL
-	a, b := alo("100"), alo("99")
 	a.Cloid, b.Cloid = first, second
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	err := c.Exchange(ctx, Place{Type: "order", Orders: []Order{a, b}, Grouping: "na"})
@@ -299,8 +305,12 @@ func TestCancelReceiptSurvivesRestartAndKeepsPartialFailure(t *testing.T) {
 	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	err = fresh.RecoverPending(ctx)
-	if !errors.Is(err, ErrExecutionRejected) || sends.Load() != 1 {
+	var partial *PartialExecutionError
+	if errors.Is(err, ErrExecutionRejected) || !errors.As(err, &partial) || sends.Load() != 1 {
 		t.Fatalf("recovery=%v sends=%d", err, sends.Load())
+	}
+	if len(partial.Executed) != 1 || partial.Executed[0].OID != 11 || len(partial.Rejected) != 1 || partial.Rejected[0].OID != 12 {
+		t.Fatalf("per-leg result = %+v", partial)
 	}
 	if _, err := os.Stat(c.pendingPath()); !os.IsNotExist(err) {
 		t.Fatalf("resolved pending remains: %v", err)
@@ -312,6 +322,10 @@ func TestBoundedLookupPassKeepsProgress(t *testing.T) {
 	c.RequireExecutionHeight = true
 	var mu sync.Mutex
 	reads := map[string]int{}
+	orders := []Order{alo("100"), alo("99"), alo("98")}
+	for i := range orders {
+		orders[i].Cloid = fmt.Sprintf("0x%032x", i+1)
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/exchange" {
 			http.Error(w, "reply unavailable", http.StatusBadGateway)
@@ -329,14 +343,16 @@ func TestBoundedLookupPassKeepsProgress(t *testing.T) {
 			return
 		case <-time.After(2 * time.Second):
 		}
-		fmt.Fprint(w, `{"height":10,"status":"order","order":{"status":"filled","order":{"oid":101}}}`)
+		for i, o := range orders {
+			if o.Cloid == q.OID {
+				fmt.Fprint(w, orderStatusBody(10, "filled", uint64(101+i), o))
+				return
+			}
+		}
+		t.Errorf("unexpected cloid %s", q.OID)
 	}))
 	defer server.Close()
 	c.URL = server.URL
-	orders := []Order{alo("100"), alo("99"), alo("98")}
-	for i := range orders {
-		orders[i].Cloid = fmt.Sprintf("0x%032x", i+1)
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := c.Exchange(ctx, Place{Type: "order", Orders: orders, Grouping: "na"}); err != nil {

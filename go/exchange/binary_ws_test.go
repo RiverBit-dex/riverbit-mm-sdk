@@ -86,6 +86,7 @@ type fakeExchange struct {
 	mu       sync.Mutex
 	requests []json.RawMessage // action_json bodies received
 	canceled map[string]bool   // cloids reported canceled
+	book     cloidBook
 }
 
 func newFakeExchange(t *testing.T, client *Client) *fakeExchange {
@@ -102,6 +103,7 @@ func newFakeExchange(t *testing.T, client *Client) *fakeExchange {
 		f.mu.Lock()
 		f.requests = append(f.requests, append(json.RawMessage(nil), frame.Data...))
 		f.mu.Unlock()
+		f.book.record(frame.Data)
 		payload := f.verify(client, frame.Data)
 		_ = c.SendJSON(0, `{"channel":"orderUpdates","data":[]}`) // a push before the reply
 		_ = c.SendJSON(frame.ID, fmt.Sprintf(`{"channel":"post","data":{"id":%d,"response":{"type":"action","payload":%s}}}`, frame.ID, payload))
@@ -131,6 +133,12 @@ func newFakeExchange(t *testing.T, client *Client) *fakeExchange {
 				status = "canceled"
 			}
 			f.mu.Unlock()
+		}
+		if cloid, ok := q.OID.(string); ok {
+			if o, known := f.book.get(cloid); known {
+				fmt.Fprint(w, orderStatusBody(7, status, orderID, o))
+				return
+			}
 		}
 		fmt.Fprintf(w, `{"height":7,"status":"order","order":{"status":%q,"order":{"coin":"RBT","oid":%d}}}`, status, orderID)
 	}))

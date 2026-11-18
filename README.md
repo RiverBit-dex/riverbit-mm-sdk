@@ -31,7 +31,9 @@ All three implementations follow the same protocol guide, share one Protobuf def
 |---|---|
 | REST queries | `https://pre-api.riverbit.io/info` |
 | REST trading | `https://pre-api.riverbit.io/exchange` |
-| WebSocket | `wss://pre-api.riverbit.io/bin-ws` |
+| WebSocket (market data, order events, queries) | `wss://pre-api.riverbit.io/bin-ws` |
+
+Orders, cancellations and modifications go through REST `/exchange`; the public WebSocket endpoint carries market data, order and fill events and queries, and does not accept order entry.
 
 Every client takes the base URL as configuration; nothing is tied to one environment.
 

@@ -22,14 +22,7 @@ from .actions import (
     Place,
     action_type,
 )
-from .errors import (
-    NotConnected,
-    NotSent,
-    PostError,
-    RequestTimeout,
-    SessionClosed,
-    UnknownOutcome,
-)
+from .errors import NotConnected, NotSent, UnknownOutcome
 from .info import InfoClient
 from .nonce import NonceSource, shared_nonce_source
 from .receipts import Receipt, interpret_reply
@@ -54,10 +47,16 @@ def _leg_count(action_json: bytes) -> int:
 class ExchangeClient:
     """Signs actions and submits them, one signer at a time.
 
-    ``base_url`` is explicit (for example ``https://pre-api.riverbit.io``). Pass
-    ``ws=`` a logged-in :class:`~riverbit_mm.ws.BinWsSession` to carry actions over
-    bin-ws (``action_json``) instead of ``POST /exchange``; the signed bytes are
-    identical either way.
+    ``base_url`` is explicit (for example ``https://pre-api.riverbit.io``). Orders
+    are sent with ``POST /exchange``: **REST is the way to send orders**.
+
+    The ``ws=`` option takes a logged-in :class:`~riverbit_mm.ws.BinWsSession` and
+    carries the same signed bytes as ``action_json`` over bin-ws instead. **The public
+    ``/bin-ws`` endpoint does not accept ``action_json``** (the server answers
+    ``504 Gateway Timeout``), so against it every such request ends as an
+    :class:`~riverbit_mm.UnknownOutcome` and you must not use ``ws=`` there. The option
+    is kept for deployments whose bin-ws endpoint does accept actions. On the public
+    endpoint use bin-ws for market data, order and fill events and ``info_json`` queries.
 
     ``chain_id`` is ``nextAgentChainId``; if omitted it is fetched once from
     ``chainIdentity``. ``vault_address`` makes every action trade for that vault
@@ -187,8 +186,14 @@ class ExchangeClient:
             return await self.ws.post_action(request.body, timeout=self.timeout)
         except NotConnected as exc:
             raise NotSent(str(exc), request=request) from exc
-        except (SessionClosed, RequestTimeout, PostError) as exc:
-            raise UnknownOutcome(str(exc), request=request, transport="bin-ws", cause=exc) from exc
+        except Exception as exc:
+            # Past this point the action may have been written to the socket. A closed
+            # session, a timeout, an error reply, and any reply that is not a well-formed
+            # answer (wrong type, mismatched inner id, undecodable) all leave the outcome
+            # unknown. Cancellation is not caught here and propagates as usual.
+            raise UnknownOutcome(
+                f"{type(exc).__name__}: {exc}", request=request, transport="bin-ws", cause=exc
+            ) from exc
 
     # -- conveniences ---------------------------------------------------------------------
 

@@ -133,11 +133,14 @@ func parseAction(raw []byte) (any, error) { return exchange.ParseAction(raw) }
 // trade submits every action from ACTION_FILE and reconciles each one before
 // the next. ORDER_TRANSPORT picks the path:
 //
-//   - ws (default): one logged-in bin-ws connection carries the order-event
+//   - rest (default): signed actions are POSTed to <API_GATEWAY_URL>/exchange
+//     and reconciled over POST /info; bin-ws is never dialed. This is the only
+//     order entry path of the public endpoint.
+//   - ws: one logged-in bin-ws connection carries the order-event
 //     subscriptions, the signed actions (action_json) and the orderStatus /
-//     openOrders reconciliation (info_json), replies matched by frame id.
-//   - rest: signed actions are POSTed to <API_GATEWAY_URL>/exchange and
-//     reconciled over POST /info; bin-ws is never dialed.
+//     openOrders reconciliation (info_json), replies matched by frame id. The
+//     public /bin-ws endpoint rejects action_json (504 Gateway Timeout), so
+//     use it only against a gateway that accepts order entry on bin-ws.
 //
 // Startup queries (chainIdentity, vault checks, userRole, metaAndAssetCtxs)
 // use HTTP /info in both modes. Uncertain outcomes are left for
@@ -206,6 +209,7 @@ func runTrade(ctx context.Context, cfg Config, logger *slog.Logger, recoverOnly 
 			return err
 		}
 	} else {
+		logger.Warn("ORDER_TRANSPORT=ws: the public bin-ws endpoint does not accept action_json (504 Gateway Timeout); use rest unless your gateway supports order entry on bin-ws")
 		session, err := dialTradeSession(ctx, cfg, client, logger)
 		if err != nil {
 			return err
@@ -219,7 +223,8 @@ func runTrade(ctx context.Context, cfg Config, logger *slog.Logger, recoverOnly 
 		observeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		recoveryErr = client.RecoverPending(observeCtx)
 		cancel()
-		if recoveryErr != nil && !errors.Is(recoveryErr, exchange.ErrExecutionRejected) {
+		var partial *exchange.PartialExecutionError
+		if recoveryErr != nil && !errors.Is(recoveryErr, exchange.ErrExecutionRejected) && !errors.As(recoveryErr, &partial) {
 			return fmt.Errorf("recovery incomplete; keep STATE_DIR and run recover again: %w", recoveryErr)
 		}
 	}

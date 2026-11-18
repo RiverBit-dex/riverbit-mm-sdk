@@ -1,6 +1,6 @@
 # RiverBit Market Maker SDK for Rust
 
-An async Rust client for market makers integrating with the RiverBit exchange API: signing, order entry, cancellation, modification, market data and reconciliation over REST and the binary WebSocket endpoint (`bin-ws`).
+An async Rust client for market makers integrating with the RiverBit exchange API: signing, order entry, cancellation, modification and reconciliation over REST, and market data and order events over the binary WebSocket endpoint (`bin-ws`).
 
 > **Status: pre-release.** Interfaces may change before `v0.1.0`. The SDK contains no quoting strategy: it gives you the protocol, signing and reconciliation building blocks to run your own. Read the [protocol guide](../docs/api-guide.md) before you trade.
 
@@ -31,7 +31,9 @@ Base URL, WebSocket URL and login host are always explicit. The PRE values below
 | Login host | `pre-api.riverbit.io` | `host:` line of the login message; must match the public server hostname |
 | Chain ID | from `chainIdentity` | `SigningDomain`; never hard-code it |
 
-An API wallet signs; the master account (or a vault it leads) is the trading account. The master must authorize the API wallet first. Keep the private key out of source control, command-line arguments and logs: the SDK never prints key material, and `Debug` output of a `Signer` shows only its address.
+An API wallet signs; the master account (or a vault it leads) is the trading account. The master must authorize the API wallet first. Keep the private key out of source control, command-line arguments, environment variables and logs: read it from a file only your process can read. The SDK never prints key material: `Debug` output of a `Signer` shows only its address, and `Debug` output of a `SignedRequest` shows the action kind, nonce and signer but not the body or the signature.
+
+**Send orders over REST.** The public `/bin-ws` endpoint does not accept `action_json` (the server replies `504 Gateway Timeout`, which for a signed action is an unknown outcome). Order entry, cancellation and modification are `POST /exchange` only; use bin-ws for market data, order and fill events and `info_json` queries.
 
 ## Quick start
 
@@ -44,7 +46,8 @@ use riverbit_mm_sdk::{
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base_url = "https://pre-api.riverbit.io";
-    let signer = Signer::from_hex(&std::env::var("RIVERBIT_PRIVATE_KEY")?)?;
+    // The key lives in a file that only your process can read.
+    let signer = Signer::from_hex(&std::fs::read_to_string(std::env::var("RIVERBIT_KEY_FILE")?)?)?;
 
     // 1. Startup queries (REST).
     let info = InfoClient::new(base_url)?;
@@ -52,13 +55,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let meta = info.meta_and_asset_ctxs().await?.meta;
     let asset = meta.asset_index("BTC").expect("BTC is listed");
 
-    // 2. Stream the book over bin-ws (the login is the first frame).
+    // 2. Stream the book over bin-ws (market data and events; the login is the first frame).
     let config = BinWsConfig::new("wss://pre-api.riverbit.io/bin-ws", "pre-api.riverbit.io", signer.clone());
     let (session, mut events) = BinWsSession::connect(config).await?;
     session.subscribe(&Subscription::l2("BTC")).await?;
     let mut book = Book::new("BTC");
 
-    // 3. Trade: the same signed bytes go out over REST or `action_json`.
+    // 3. Trade over REST `POST /exchange`: the public bin-ws endpoint does not accept orders.
     let exchange = ExchangeClient::new(base_url, signer, SigningDomain::new(chain_id))?;
     let order = Order::limit(asset, true, "50000", "0.001", Tif::Alo).with_cloid(Cloid::random()?);
     match exchange.send(&Place::new(vec![order])).await {
@@ -87,9 +90,9 @@ More complete programs are in [`examples/`](examples/):
 | [`stream_market_data`](examples/stream_market_data.rs) | Streams the `l2` book and prints the best bid and ask |
 | [`place_query_cancel`](examples/place_query_cancel.rs) | Places a post-only order, queries its status, cancels it |
 | [`batch_modify`](examples/batch_modify.rs) | Places two orders, moves both with one `batchModify`, cancels them |
-| [`reconcile_after_reconnect`](examples/reconcile_after_reconnect.rs) | Trades over bin-ws; after a reconnect looks up the pending request by cloid |
+| [`reconcile_after_reconnect`](examples/reconcile_after_reconnect.rs) | Sends an order over REST, follows order events over bin-ws and looks up a pending request by cloid, including after a reconnect |
 
-The examples read `RIVERBIT_PRIVATE_KEY` and, optionally, `RIVERBIT_BASE_URL`, `RIVERBIT_WS_URL`, `RIVERBIT_LOGIN_HOST` and `RIVERBIT_COIN` from the environment. The trading examples send real signed orders to whatever environment they point at.
+The examples read the key from the file named by `RIVERBIT_KEY_FILE` (for example `RIVERBIT_KEY_FILE=./key cargo run --example place_query_cancel`; keep that file out of source control) and, optionally, `RIVERBIT_BASE_URL`, `RIVERBIT_WS_URL`, `RIVERBIT_LOGIN_HOST` and `RIVERBIT_COIN` from the environment. All examples send orders over REST. The trading examples send real signed orders to whatever environment they point at.
 
 ## Capabilities
 
@@ -99,8 +102,9 @@ The examples read `RIVERBIT_PRIVATE_KEY` and, optionally, `RIVERBIT_BASE_URL`, `
 | bin-ws login signature (EIP-191) | Yes |
 | Actions `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`; `Cloid`; fixed field order; decimal-string prices and sizes | Yes |
 | REST `/info` client: `chainIdentity`, `userRole`, `leadingVaults`, `metaAndAssetCtxs`, `l2Book`, `openOrders`, `frontendOpenOrders`, `orderStatus`, `userFills`, `clearinghouseState`, `candleSnapshot`; `Retry-After` honoured on 429 | Yes |
-| REST `/exchange` client with per-leg receipts | Yes |
-| bin-ws: connect, login first, subscribe, unsubscribe, ping, id-matched `action_json` and `info_json`, reconnect with login and resubscribe | Yes |
+| REST `/exchange` client with per-leg receipts. Never follows redirects | Yes |
+| bin-ws: connect, login first, subscribe, unsubscribe, ping, id-matched `info_json`, reconnect with login and resubscribe | Yes |
+| bin-ws order entry (`action_json`) | Code kept, **not usable on the public endpoint**: it does not accept `action_json` (`504 Gateway Timeout`). Use REST `/exchange` |
 | Typed frames `l2` delta, `l2Book`, `bbo`, `trades`, `candle`; all other streams as JSON; typed streams that fall back to JSON | Yes |
 | Local order book replaying `l2` snapshots and updates | Yes |
 | Per-leg `statuses[]` parsing; rejected, rate-limited and unknown-outcome errors | Yes |
@@ -119,7 +123,7 @@ The examples read `RIVERBIT_PRIVATE_KEY` and, optionally, `RIVERBIT_BASE_URL`, `
 | `Cloid` | 128-bit client order ID, `0x` plus 32 hex digits |
 | `NonceSource` | Millisecond nonces, strictly increasing; one shared counter per signer in a process |
 | `SignedRequest` | A signed request body, nonce and targets. `ExchangeClient::prepare` creates one; `submit` sends it |
-| `ExchangeClient` | `send(action)`, `prepare`, `submit`. REST by default, or any `ActionTransport` such as a `BinWsSession`; `for_vault` trades for a vault |
+| `ExchangeClient` | `send(action)`, `prepare`, `submit`. REST `POST /exchange` by default; `for_vault` trades for a vault. A custom `ActionTransport` (including a `BinWsSession`, which the public endpoint does not support for orders) can replace REST |
 | `InfoClient` | Typed `/info` queries and `query` for any other. Optional routing over bin-ws `info_json` (`with_bin_ws`); `metaAndAssetCtxs`, `userRole` and `leadingVaults` always use REST |
 | `BinWsSession`, `BinWsConfig`, `Events`, `Event` | The connection. `subscribe`, `unsubscribe`, `ping`, `info`, `close`; pushes arrive as `Event::Frame` |
 | `Subscription` | Constructors for `l2`, `l2Book`, `bbo`, `trades`, `candle`, `orderUpdates`, `openOrders`, `userFills`, `clearinghouseState` and `raw` |
@@ -135,9 +139,10 @@ The examples read `RIVERBIT_PRIVATE_KEY` and, optionally, `RIVERBIT_BASE_URL`, `
 
 | Variant | Meaning | What to do |
 |---|---|---|
-| `Rejected` | The exchange refused the whole action and nothing executed (for example code 91, 203, 204, 205, 1160, or `PrecisionExceeded`) | Fix the cause, then sign a new request with a new nonce |
+| `Rejected` | The exchange refused the whole action and nothing executed (for example code 91, 203, 204 or 1160, or one `PrecisionExceeded` status for a multi-leg action) | Fix the cause, then sign a new request with a new nonce |
 | `RateLimited` | A read was throttled and the retry budget ran out | Wait for `retry_after` |
-| `UnknownOutcome` | The action may or may not have executed: timeout, disconnect, an HTTP error or 429 on `/exchange`, an unparseable or ambiguous reply | Keep it pending and reconcile. **Never re-sign it with a new nonce** |
+| `UnknownOutcome` | The action may or may not have executed: timeout, disconnect, an HTTP error, a redirect or 429 on `/exchange`, an unparseable or ambiguous reply, a duplicate nonce (code 205), `action already pending`, or a receipt whose statuses do not match the submitted legs | Keep it pending and reconcile. **Never re-sign it with a new nonce** |
+| `NotSent` | The request was provably never written (a bin-ws post that timed out while still queued). Nothing executed | The same signed request may be submitted again |
 
 An `UnknownOutcome` carries the signed request: nonce, the exact bytes sent, the oids and cloids the action referred to, the reason and any legs that were observed. Submitting the same `SignedRequest` again is safe (a duplicate nonce cannot execute twice), but the reply to a duplicate does not tell you what the original did. Reconcile instead:
 

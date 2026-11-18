@@ -659,3 +659,108 @@ async fn posting_while_disconnected_fails_fast() {
     );
     session.close().await;
 }
+
+const PUSH: &str = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe"}}"#;
+
+/// Blocks the session task on a full event queue: a capacity of one, and pushes
+/// nobody reads.
+async fn stalled_session(
+    request_timeout: Duration,
+) -> (WsServer, BinWsSession, Events, common::ServerConn) {
+    let mut srv = server().await;
+    let mut cfg = config(&srv);
+    cfg.event_capacity = 1;
+    cfg.request_timeout = request_timeout;
+    let (session, events) = BinWsSession::connect(cfg).await.unwrap();
+    let conn = srv.conns.recv().await.unwrap();
+    for _ in 0..3 {
+        conn.json(0, PUSH);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The caller keeps `conn`: dropping it would end the connection.
+    (srv, session, events, conn)
+}
+
+/// Drains the events so the session task can run again, then reports whether
+/// the server ever received an `action_json` frame.
+async fn action_reached_server(srv: &mut WsServer, events: &mut Events) -> bool {
+    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(300), events.next()).await {}
+    let mut seen_action = false;
+    while let Ok((_, seen)) = tokio::time::timeout(Duration::from_millis(300), srv.seen.recv())
+        .await
+        .map(|s| s.expect("server closed"))
+    {
+        if let Seen::Frame(f) = seen {
+            seen_action |= matches!(f.body, ClientBody::ActionJson(_));
+        }
+    }
+    seen_action
+}
+
+#[tokio::test]
+async fn a_post_that_timed_out_while_queued_is_never_written() {
+    let (mut srv, session, mut events, _conn) = stalled_session(Duration::from_millis(300)).await;
+    let ex = ExchangeClient::with_transport(
+        Arc::new(session.clone()),
+        signer(),
+        SigningDomain::new(12589),
+    );
+    let request = ex.prepare(&place_one()).unwrap();
+    let err = ex.submit(&request).await.unwrap_err();
+    match &err {
+        Error::NotSent { request: r, .. } => assert_eq!(r.body(), request.body()),
+        other => panic!("not provably unsent: {other:?}"),
+    }
+    assert!(!err.is_unknown_outcome());
+    assert!(
+        !action_reached_server(&mut srv, &mut events).await,
+        "a post whose caller gave up must not be written"
+    );
+    session.close().await;
+}
+
+#[tokio::test]
+async fn a_post_dropped_by_an_outer_timeout_is_never_written() {
+    // The client's own timeout is shorter than the session's: the future is
+    // dropped while the post is still queued. That is reported as an unknown
+    // outcome (the client cannot tell), but the order must not go out later.
+    let (mut srv, session, mut events, _conn) = stalled_session(Duration::from_secs(20)).await;
+    let ex = ExchangeClient::with_transport(
+        Arc::new(session.clone()),
+        signer(),
+        SigningDomain::new(12589),
+    )
+    .with_timeout(Duration::from_millis(300));
+    let err = ex.send(&place_one()).await.unwrap_err();
+    assert_eq!(
+        err.as_unknown_outcome().expect("unknown outcome").reason,
+        UnknownReason::Timeout
+    );
+    assert!(
+        !action_reached_server(&mut srv, &mut events).await,
+        "a post whose caller gave up must not be written"
+    );
+    session.close().await;
+}
+
+#[tokio::test]
+async fn a_written_post_without_a_reply_is_an_unknown_outcome() {
+    let mut srv = server().await;
+    let mut cfg = config(&srv);
+    cfg.request_timeout = Duration::from_millis(300);
+    let (session, _events) = BinWsSession::connect(cfg).await.unwrap();
+    let _conn = srv.conns.recv().await.unwrap();
+    let ex = ExchangeClient::with_transport(
+        Arc::new(session.clone()),
+        signer(),
+        SigningDomain::new(12589),
+    );
+    let err = ex.send(&place_one()).await.unwrap_err();
+    assert_eq!(
+        err.as_unknown_outcome().expect("unknown outcome").reason,
+        UnknownReason::Timeout
+    );
+    let (_, frame) = next_frame(&mut srv).await;
+    assert!(matches!(frame.body, ClientBody::ActionJson(_)));
+    session.close().await;
+}

@@ -1,6 +1,7 @@
 package exchange
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -42,4 +43,16 @@ func (c *Cloid) UnmarshalJSON(data []byte) error {
 // string in both representations.
 func (c Cloid) MarshalMsgpack() ([]byte, error) {
 	return msgpack.Marshal(c.String())
+}
+
+// NewCloid returns a fresh random client order ID as the 0x-prefixed lowercase
+// hex string for Order.Cloid. Use one per order. A cloid must not be reused
+// while any earlier request that carried it is unresolved: a lookup by cloid
+// cannot tell the two orders apart.
+func NewCloid() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return "0x" + hex.EncodeToString(b[:]), nil
 }

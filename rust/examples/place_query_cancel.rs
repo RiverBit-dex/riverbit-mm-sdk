@@ -2,7 +2,7 @@
 //! cancels it.
 //!
 //! ```text
-//! RIVERBIT_PRIVATE_KEY=0x... RIVERBIT_PRICE=50000 RIVERBIT_SIZE=0.001 \
+//! RIVERBIT_KEY_FILE=./key RIVERBIT_PRICE=50000 RIVERBIT_SIZE=0.001 \
 //!   cargo run --example place_query_cancel
 //! ```
 //!

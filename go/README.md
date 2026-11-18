@@ -1,6 +1,6 @@
 # RiverBit market maker SDK for Go
 
-Go client library for the RiverBit exchange API: signing, order entry, cancellation, modification, market data over the binary WebSocket (`bin-ws`), and reconciliation of requests whose outcome is unknown.
+Go client library for the RiverBit exchange API: signing, order entry over REST, cancellation, modification, market data over the binary WebSocket (`bin-ws`), and reconciliation of requests whose outcome is unknown.
 
 > **Status: pre-release.** Interfaces may change before `v0.1.0`. The SDK contains no quoting strategy: it gives you the protocol, signing and reconciliation building blocks to run your own. Read the [protocol guide](../docs/api-guide.md) before you trade.
 
@@ -18,14 +18,14 @@ Requires Go 1.24 or newer. The module path ends in `/go` because the repository 
 
 | Package | Contents |
 |---|---|
-| [`exchange`](exchange/) | `Signer`, action types, `Client` (signing, REST and bin-ws submission, receipts, durable pending journal, recovery), `InfoClient` (REST `/info`), error types |
+| [`exchange`](exchange/) | `Signer`, action types, `Client` (signing, REST submission, receipts, durable pending journal, recovery), `InfoClient` (REST `/info`), error types |
 | [`binws`](binws/) | bin-ws frames and codec, login, `Session`, reconnecting `Run`, `Router` for typed frames, `Book` for the incremental `l2` stream |
 | [`binws/binwstest`](binws/binwstest/) | In-process fake bin-ws server for your own tests |
 | [`examples/mmcli`](examples/mmcli/) | Example command-line client (market data, `trade`, `recover`) built only on the packages above |
 
 ## Quick start
 
-Watch a book over bin-ws, then place and cancel one order. An API wallet signs; the master account (or a vault it leads) is the trading account, and the master must authorize the API wallet first.
+Watch a book over bin-ws, then place one order over REST. An API wallet signs; the master account (or a vault it leads) is the trading account, and the master must authorize the API wallet first.
 
 ```go
 package main
@@ -59,7 +59,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// One authenticated bin-ws session carries market data and signed actions.
+	// One authenticated bin-ws session carries market data and the reconciliation queries.
 	router := &binws.Router{
 		Book: binws.NewBook("BTC"),
 		OnBook: func(b *binws.Book, snapshot bool) {
@@ -75,13 +75,15 @@ func main() {
 	defer session.Close()
 	_ = session.Subscribe(binws.L2("BTC"))
 
-	// The trading client. StateDir turns on the durable pending journal.
+	// The trading client. Orders go out as REST POST /exchange: the public
+	// /bin-ws endpoint does not accept action_json (it answers 504 Gateway
+	// Timeout), so leave client.WS nil. StateDir turns on the durable pending journal.
 	client, err := exchange.New(restURL, signer)
 	if err != nil {
 		log.Fatal(err)
 	}
-	client.WS, client.Queries = session, session // actions as action_json, reconciliation as info_json
-	client.StateDir = "state"                    // one directory per signer
+	client.Queries = session  // reconciliation queries as info_json (optional; REST /info otherwise)
+	client.StateDir = "state" // one directory per signer
 	if err := client.SetPrincipal(session.User()); err != nil { // the master the login resolved
 		log.Fatal(err)
 	}
@@ -92,34 +94,43 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// A fresh cloid per order. Never reuse a cloid while any earlier request
+	// that carried it is unresolved: a lookup by cloid cannot tell the orders apart.
 	order := exchange.LimitOrder(btc.Index, true, "80000", "0.001", "Alo")
-	order.Cloid = "0x00000000000000000000000000000001"
+	if order.Cloid, err = exchange.NewCloid(); err != nil {
+		log.Fatal(err)
+	}
+	var partial *exchange.PartialExecutionError
 	switch err := client.Exchange(ctx, exchange.NewPlace(order)); {
 	case err == nil:
 		fmt.Println("placed, order IDs", client.LastOrderIDs)
 	case errors.Is(err, exchange.ErrExecutionRejected):
-		fmt.Println("rejected:", err) // final; fix the cause, a new request gets a new nonce
+		fmt.Println("rejected, no leg executed:", err) // final; fix the cause, a new request gets a new nonce
+	case errors.As(err, &partial):
+		fmt.Println("some legs ran:", partial.Executed, "rejected:", partial.Rejected, "to track:", partial.Tracking)
 	default:
 		fmt.Println("outcome unknown:", err) // reconcile with RecoverPending; never resend
 	}
 }
 ```
 
+Order entry is REST `POST /exchange`. The public `/bin-ws` endpoint does not accept `action_json` (the server replies `504 Gateway Timeout`); use bin-ws for market data, order and fill events, and `info_json` queries. `Client.WS` sends signed actions as `action_json` for gateways that do accept it; it is not for the public endpoint, and an error reply to an action is always an unknown outcome, never a rejection.
+
 ## Capabilities
 
 | Capability | Where | Notes |
 |---|---|---|
-| Action signing (EIP-712, MessagePack key order, with or without a vault) | `exchange.Client.Sign`, `SignedRequest` | Signed bytes and sent bytes are the same bytes. Reproduces every vector in `testdata/vectors.json` byte for byte |
+| Action signing (EIP-712, MessagePack key order, with or without a vault) | `exchange.Client.Sign`, `SignedRequest` | Signed bytes and sent bytes are the same bytes. Accepts only the SDK action types (or the result of `ParseAction` for raw JSON); maps and `json.RawMessage` are refused. Reproduces every vector in `testdata/vectors.json` byte for byte |
 | bin-ws login signing (EIP-191) | `exchange.Signer.PersonalSign`, `binws.NewLogin` | `binws.Signer` is an interface, so a remote or hardware key can sign |
 | Actions: `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify` | `exchange.Place`, `Cancel`, `CancelByCloid`, `Modify`, `BatchModify`; `NewPlace`, `LimitOrder`, ... | Prices and sizes are decimal strings end to end. `exchange.Cloid` is a 128-bit client order ID |
 | REST `/info` | `exchange.InfoClient` | `Query` for any type; typed helpers for `chainIdentity`, `metaAndAssetCtxs`, `userRole`, `openOrders`. 429 is retried: it waits for `Retry-After` when present, otherwise capped exponential backoff |
-| REST `/exchange` | `exchange.Client` | One request body for REST and bin-ws |
-| bin-ws session | `binws.Dial`, `Session` | First-frame login, subscribe/unsubscribe, ping, `action_json` and `info_json` requests matched by frame id |
+| REST `/exchange` | `exchange.Client` | The order entry path of the public endpoint. Redirects are never followed: a 3xx answer is an unknown outcome |
+| bin-ws session | `binws.Dial`, `Session` | First-frame login, subscribe/unsubscribe, ping, `action_json` and `info_json` requests matched by frame id (the public endpoint rejects `action_json`; see above) |
 | Reconnect | `binws.Run` | Reconnect, log in again, resubscribe, with backoff |
 | Typed frames | `binws.Router` | `l2`, `l2Book`, `bbo`, `trades`, `candle`; other streams arrive as JSON; the JSON fallbacks of typed streams are handled |
 | Local order book | `binws.Book` | Replays `l2` snapshots and updates (typed and JSON), exact `big.Rat` levels |
-| Receipts | `exchange.ParseReceipt`, `Client.LastReceipt` | Per-leg `resting`, `filled`, `error`, ... |
-| Error classes | `*exchange.ActionRejectedError`, `ErrExecutionRejected`, `*exchange.RateLimitError`, `*exchange.UnknownOutcomeError` | Whole-action rejection, rate limit and unknown outcome are distinct types; per-leg rejections are in the receipt |
+| Receipts | `exchange.ParseReceipt`, `Client.LastReceipt` | Per-leg `resting`, `filled`, `error`, ... A receipt must carry one well-formed status per leg, with an order ID on `resting` and `filled`; a short or malformed one is an unknown outcome |
+| Error classes | `*exchange.ActionRejectedError`, `ErrExecutionRejected`, `*exchange.PartialExecutionError`, `*exchange.RateLimitError`, `*exchange.UnknownOutcomeError` | Rejection of every leg, partial execution, rate limit and unknown outcome are distinct types. `ErrExecutionRejected` means no leg executed; when some legs ran and others were rejected or wait for a fill or trigger, `PartialExecutionError` lists them per leg. A duplicate nonce (code 205) is an unknown outcome: the original may have executed |
 | Nonces | `exchange.Client` | Millisecond timestamps, unique per signer in the process, persisted as a floor in `StateDir` |
 | **Durable pending journal and `recover`** | `Client.StateDir`, `RecoverPending` | Every request is journaled before it is sent. After a timeout, disconnect or restart it is resolved by order ID or client order ID, never re-signed with a new nonce. Audit log and execution-height floor included. Needs a Unix-like OS (advisory file lock) |
 | Fake bin-ws server | `binws/binwstest` | Real login check, scripted replies |
@@ -132,9 +143,10 @@ Not included: quoting or risk logic, automatic cancellation on shutdown, a cross
 - `exchange.NewSigner(hexKey)` loads a key. `exchange.New(url, signer)` trades for the signer's own account; `NewForVault(url, signer, vault)` for a vault; `SetPrincipal(master)` records the master an API wallet acts for. Call `VerifySubAccount` before trading for a vault.
 - Set `SignChainID` through `Client.LoadChainID`; there is no default, and a wrong value gives code 91.
 - `Client.Exchange(ctx, action)` signs, sends and reconciles. `LastOrderIDs`, `LastStatuses` and `LastReceipt` describe the last request. `RecoverPending(ctx)` only observes: it queries and never submits.
-- Set `Client.WS` and `Client.Queries` to a `*binws.Session` to use bin-ws for actions and reconciliation queries; leave them nil for REST.
+- Orders are submitted over REST by default. Set `Client.Queries` to a `*binws.Session` to run the reconciliation queries over bin-ws `info_json`. `Client.WS` sends actions over bin-ws `action_json`, which the public endpoint rejects (`504 Gateway Timeout`); leave it nil there.
+- Use `exchange.NewCloid()` for a fresh client order ID per order. A cloid must not be reused while any earlier request with it is unresolved: recovery accepts an order found by cloid only if it was created after the request was journaled and has the submitted side, price and size, and otherwise keeps the request pending. When the reply carried a receipt, recovery follows the order IDs in it instead.
 - `binws.Config.OnFrame` receives pushes; `Router.Handle` is a ready callback. `Config.Sign` takes an `exchange.Signer`.
-- Errors: `errors.As` into `*exchange.UnknownOutcomeError` to get the nonce, account, signed action and cloids to reconcile; `errors.Is(err, exchange.ErrExecutionRejected)` for a final rejection.
+- Errors: `errors.As` into `*exchange.UnknownOutcomeError` to get the nonce, account, signed action and cloids to reconcile; `errors.Is(err, exchange.ErrExecutionRejected)` for a final rejection in which no leg executed; `errors.As` into `*exchange.PartialExecutionError` for a request in which some legs executed (`Executed`), some were rejected (`Rejected`) and some wait (`Tracking`). Partial success is not rolled back: never resend the whole request.
 
 Run `go doc github.com/riverbit-dex/riverbit-mm-sdk/go/exchange` (and `.../binws`) for the full reference.
 
@@ -160,7 +172,7 @@ KEY_FILE=./key go run ./examples/mmcli recover
 | `API_GATEWAY_URL` | `https://pre-api.riverbit.io` | REST base URL |
 | `COIN` | `BTC` | market to watch and trade |
 | `BOOK_STREAM` | `l2` | `l2` (incremental) or `l2Book` (snapshots) |
-| `ORDER_TRANSPORT` | `ws` | `ws` (one bin-ws connection) or `rest` |
+| `ORDER_TRANSPORT` | `rest` | `rest` (`POST /exchange`) or `ws` (bin-ws `action_json`; the public endpoint rejects it with `504 Gateway Timeout`, use it only against a gateway that accepts order entry on bin-ws) |
 | `GUILD_VAULT_ADDRESS` | empty | trade for this vault; the signer must lead it or be its API wallet |
 | `KEY_FILE` | `key` | file with the private key |
 | `STATE_DIR` | `state` | durable pending journal directory |

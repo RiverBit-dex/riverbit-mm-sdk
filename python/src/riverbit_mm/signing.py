@@ -62,12 +62,17 @@ class Signature:
         return bytes.fromhex(self.r[2:]) + bytes.fromhex(self.s[2:]) + bytes([self.v])
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class SignedRequest:
     """A fully signed ``/exchange`` request.
 
     ``body`` is the exact byte string to POST to ``/exchange`` or to send as
     ``action_json``. Never rebuild it from ``action_json``: send these bytes.
+
+    ``repr`` and ``str`` are deliberately short: they show the nonce, the action
+    type and the signer address, but neither the signature nor the signed body, so
+    a log line or traceback never carries a complete submittable request. The bytes
+    stay available through :attr:`body`, :attr:`action_json` and :attr:`signature`.
     """
 
     body: bytes
@@ -77,6 +82,32 @@ class SignedRequest:
     vault_address: str | None
     connection_id: bytes
     digest: bytes
+
+    @property
+    def signer_address(self) -> str | None:
+        """Lowercase address recovered from the signature, or ``None`` if it cannot be."""
+        try:
+            from coincurve import PublicKey
+
+            recid = self.signature.v - 27
+            pub = PublicKey.from_signature_and_message(
+                self.signature.to_bytes()[:64] + bytes([recid]), self.digest, hasher=None
+            )
+            return "0x" + keccak256(pub.format(compressed=False)[1:])[-20:].hex()
+        except Exception:
+            return None
+
+    def __repr__(self) -> str:
+        try:
+            kind = json.loads(self.action_json).get("type")
+        except (ValueError, AttributeError):
+            kind = None
+        parts = [f"nonce={self.nonce}", f"action={kind!r}", f"signer={self.signer_address}"]
+        if self.vault_address is not None:
+            parts.append(f"vault={self.vault_address}")
+        return f"SignedRequest({', '.join(parts)})"
+
+    __str__ = __repr__
 
 
 def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

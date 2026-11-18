@@ -9,6 +9,9 @@
 //! * [`Error::UnknownOutcome`]: the action may or may not have executed.
 //!   It carries the nonce and the exact signed bytes. Reconcile it; **never**
 //!   sign the same intent again with a new nonce.
+//! * [`Error::NotSent`]: the request was provably never written (for example a
+//!   bin-ws post whose caller timed out while it was still queued). Nothing
+//!   executed; the same signed request may be submitted again.
 
 use std::fmt;
 use std::time::Duration;
@@ -36,6 +39,17 @@ pub enum Error {
     /// A write whose outcome is not known. Keep it pending and reconcile.
     #[error("outcome unknown ({}); reconcile nonce {} instead of resending", .0.reason, .0.request.nonce())]
     UnknownOutcome(Box<UnknownOutcome>),
+
+    /// A signed request that was provably never written to the connection:
+    /// it timed out while still queued. Nothing executed, so submitting the
+    /// same request again is safe and no reconciliation is needed.
+    #[error("request not sent ({reason}); nonce {} may be submitted again", .request.nonce())]
+    NotSent {
+        /// The signed request, unchanged.
+        request: Box<SignedRequest>,
+        /// Why it was not sent.
+        reason: String,
+    },
 
     /// The caller supplied something that cannot be sent.
     #[error("invalid input: {0}")]
@@ -104,7 +118,9 @@ fn fmt_retry_after(retry_after: &Option<Duration>) -> String {
 /// An explicit rejection of a whole action. Nothing executed.
 #[derive(Debug, Clone)]
 pub struct Rejected {
-    /// The execution-layer code, for example 91, 203, 204, 205 or 1160.
+    /// The execution-layer code, for example 91, 203, 204 or 1160. Code 205
+    /// (duplicate nonce) is never reported here: the original request may have
+    /// executed, so it is an [`UnknownOutcome`].
     pub code: Option<u32>,
     /// The server's message.
     pub message: String,
@@ -147,7 +163,8 @@ pub enum UnknownReason {
     MalformedReply,
     /// The reply is valid but does not prove a final outcome: mixed or
     /// incomplete `statuses[]`, `committedResult`, `localCommitted`, a
-    /// query-before-retry hint, or a leg count that does not match.
+    /// query-before-retry hint, a leg count that does not match, a duplicate
+    /// nonce (code 205) or `action already pending`.
     AmbiguousReceipt,
 }
 

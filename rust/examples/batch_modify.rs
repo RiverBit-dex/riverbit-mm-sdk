@@ -2,7 +2,7 @@
 //! them.
 //!
 //! ```text
-//! RIVERBIT_PRIVATE_KEY=0x... RIVERBIT_SIZE=0.001 \
+//! RIVERBIT_KEY_FILE=./key RIVERBIT_SIZE=0.001 \
 //!   RIVERBIT_BID=50000 RIVERBIT_ASK=90000 \
 //!   RIVERBIT_NEW_BID=50010 RIVERBIT_NEW_ASK=89990 \
 //!   cargo run --example batch_modify
