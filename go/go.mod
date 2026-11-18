@@ -1,6 +1,6 @@
 module github.com/riverbit-dex/riverbit-mm-sdk/go
 
-go 1.26.9
+go 1.24.0
 
 require (
 	github.com/ethereum/go-ethereum v1.17.1

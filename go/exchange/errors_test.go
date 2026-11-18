@@ -114,6 +114,34 @@ func TestUnknownOutcomeWithoutJournalCarriesWhatReconciliationNeeds(t *testing.T
 	}
 }
 
+// A 429 on a signed action is not retried and not proof of non-execution: it is
+// an unknown outcome, even when the reply carries Retry-After.
+func TestRateLimitedWriteIsAnUnknownOutcome(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	client, err := newTestClient(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SignChainID = 12589
+	order := LimitOrder(0, true, "100", "1", "Alo")
+	order.Cloid = "0x00000000000000000000000000000001"
+	err = client.Exchange(context.Background(), NewPlace(order))
+	var unknown *UnknownOutcomeError
+	var rejected *ActionRejectedError
+	if !errors.As(err, &unknown) || errors.As(err, &rejected) || calls.Load() != 1 {
+		t.Fatalf("err = %v, calls = %d", err, calls.Load())
+	}
+	if unknown.Nonce == 0 || len(unknown.Cloids) != 1 {
+		t.Fatalf("unknown outcome = %+v", unknown)
+	}
+}
+
 func TestRateLimitedReadsHonorRetryAfter(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -132,6 +160,61 @@ func TestRateLimitedReadsHonorRetryAfter(t *testing.T) {
 	}
 	if calls.Load() != 2 || time.Since(start) < time.Second {
 		t.Fatalf("calls=%d after %v; the retry must wait for Retry-After", calls.Load(), time.Since(start))
+	}
+}
+
+func TestRateLimitedReadsBackOffWithoutRetryAfter(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) <= 2 {
+			http.Error(w, "slow down", http.StatusTooManyRequests) // no Retry-After header
+			return
+		}
+		fmt.Fprint(w, `{"nextAgentChainId":12589}`)
+	}))
+	defer server.Close()
+	start := time.Now()
+	id, err := NewInfoClient(server.URL).ChainIdentity(context.Background())
+	if err != nil || id.SignChainID() != 12589 {
+		t.Fatalf("identity = %+v, %v", id, err)
+	}
+	// Backoff starts at 250 ms and doubles: 250 ms + 500 ms before the third call.
+	if elapsed := time.Since(start); calls.Load() != 3 || elapsed < 700*time.Millisecond || elapsed > 5*time.Second {
+		t.Fatalf("calls=%d after %v; expected two backoff waits (about 750 ms)", calls.Load(), elapsed)
+	}
+}
+
+func TestRetryRateLimitedPrefersRetryAfterOverBackoff(t *testing.T) {
+	calls := 0
+	start := time.Now()
+	err := retryRateLimited(context.Background(), func() error {
+		calls++
+		if calls == 1 {
+			return &RateLimitError{Path: "/info", RetryAfter: 30 * time.Millisecond}
+		}
+		return nil
+	})
+	// The first backoff step would be 250 ms; a shorter Retry-After is honored as sent.
+	if elapsed := time.Since(start); err != nil || calls != 2 || elapsed >= 200*time.Millisecond {
+		t.Fatalf("err=%v calls=%d elapsed=%v", err, calls, elapsed)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	for value, want := range map[string]time.Duration{
+		"":                              0,
+		"3":                             3 * time.Second,
+		" 7 ":                           7 * time.Second,
+		"0":                             0,
+		"-1":                            0,
+		"soon":                          0,
+		"Fri, 02 Jan 2026 03:04:15 GMT": 10 * time.Second,
+		"Fri, 02 Jan 2026 03:04:00 GMT": 0,
+	} {
+		if got := parseRetryAfter(value, now); got != want {
+			t.Errorf("parseRetryAfter(%q) = %v, want %v", value, got, want)
+		}
 	}
 }
 

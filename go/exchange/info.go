@@ -184,9 +184,7 @@ func postRaw(ctx context.Context, client *http.Client, base, path string, data [
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		limit := &RateLimitError{Path: path, Body: truncate(raw, 500)}
-		if secs, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); err == nil && secs >= 0 {
-			limit.RetryAfter = time.Duration(secs) * time.Second
-		}
+		limit.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 		return limit
 	}
 	if resp.StatusCode != 200 {
@@ -196,6 +194,24 @@ func postRaw(ctx context.Context, client *http.Client, base, path string, data [
 		return fmt.Errorf("%s invalid JSON: %w", path, err)
 	}
 	return nil
+}
+
+// parseRetryAfter reads a Retry-After value: whole seconds or an HTTP date.
+// It returns zero when the value is absent, malformed or not in the future.
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if secs, err := strconv.Atoi(value); err == nil {
+		if secs < 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		if d := at.Sub(now); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 func truncate(b []byte, n int) string {

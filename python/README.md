@@ -2,7 +2,9 @@
 
 Python client library for market makers integrating with the RiverBit exchange API: signing, order entry, cancellation and modification, market data over the binary WebSocket (`bin-ws`), and reconciliation of requests whose outcome is unknown.
 
-> **Status: pre-release (`0.1.0.dev0`).** Interfaces may change before `v0.1.0`. The SDK contains **no quoting strategy**: it gives you the protocol, signing and reconciliation building blocks. Read the [protocol guide](../docs/api-guide.md) before you trade.
+> **Status: pre-release.** Interfaces may change before `v0.1.0`. The SDK contains no quoting strategy: it gives you the protocol, signing and reconciliation building blocks to run your own. Read the [protocol guide](../docs/api-guide.md) before you trade.
+
+Repository: <https://github.com/RiverBit-dex/riverbit-mm-sdk>
 
 - Python 3.10 or newer, fully type-annotated (`py.typed`), `asyncio` for all network I/O.
 - Signing and encoding are plain synchronous functions.
@@ -13,7 +15,7 @@ Python client library for market makers integrating with the RiverBit exchange A
 From Git (this library lives in the `python/` subdirectory of the repository):
 
 ```sh
-pip install "git+https://github.com/riverbit-dex/riverbit-mm-sdk.git#subdirectory=python"
+pip install "git+https://github.com/RiverBit-dex/riverbit-mm-sdk.git#subdirectory=python"
 ```
 
 From a checkout, for development:
@@ -139,7 +141,7 @@ Everything below is importable from `riverbit_mm`.
 - `Signer(private_key)`: `address`, `address_lower`, `sign_action(action_json, nonce, chain_id=..., vault_address=None) -> SignedRequest`, `sign_login(host, timestamp_ms, nonce=None)`.
 - `SignedRequest`: `body` (the exact bytes to POST or send as `action_json`), `action_json`, `nonce`, `signature`, `vault_address`, `connection_id`, `digest`. The request body is assembled around the very bytes the signature was computed from; nothing is serialised twice.
 
-**Actions** (`riverbit_mm.actions`): `Order`, `Place` (the `order` action), `Cancel` / `CancelItem`, `CancelByCloid` / `CancelByCloidItem`, `Modify`, `BatchModify` / `ModifyItem`, `Cloid`. Each action has `to_json() -> bytes`. `Order` is one leg; wrap legs in `Place`.
+**Actions** (`riverbit_mm.actions`): `Order`, `Place` (the `order` action), `Cancel` / `CancelItem`, `CancelByCloid` / `CancelByCloidItem`, `Modify`, `BatchModify` / `ModifyItem`, `Cloid`. Each action has `to_json() -> bytes`. `Place` is the `order` action and `Order` is one order leg; `CancelItem`, `CancelByCloidItem` and `ModifyItem` are the legs of `cancel`, `cancelByCloid` and `batchModify`. Wrap legs in the action: `Place` takes `Order`s, `Cancel` takes `CancelItem`s, `CancelByCloid` takes `CancelByCloidItem`s, `BatchModify` takes `ModifyItem`s; `Modify` takes one oid and one `Order`.
 
 ```python
 Place([Order(asset=1, is_buy=True, price="80000", size="0.001", tif="Alo", cloid=Cloid.random())])

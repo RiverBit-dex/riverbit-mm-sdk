@@ -342,20 +342,24 @@ func (c *Client) Info(ctx context.Context, body, out any) error {
 	return c.InfoClient().Query(ctx, body, out)
 }
 
-// retryRateLimited repeats call with the server's Retry-After, or capped
-// exponential backoff, while it fails with a *RateLimitError. When the context
-// ends first it returns the context error joined with the last rate-limit error.
+// retryRateLimited repeats call while it fails with a *RateLimitError. It
+// waits for the server's Retry-After when the reply carried a positive one;
+// otherwise (header absent, zero or malformed) it backs off exponentially from
+// 250 ms up to 8 s. When the context ends first it returns the context error
+// joined with the last rate-limit error.
 func retryRateLimited(ctx context.Context, call func() error) error {
-	delay := 250 * time.Millisecond
+	const maxBackoff = 8 * time.Second
+	backoff := 250 * time.Millisecond
 	for {
 		err := call()
 		var limit *RateLimitError
 		if err == nil || !errors.As(err, &limit) {
 			return err
 		}
-		wait := delay
-		if limit.RetryAfter > wait {
-			wait = limit.RetryAfter
+		wait := limit.RetryAfter
+		if wait <= 0 {
+			wait = backoff
+			backoff = min(backoff*2, maxBackoff)
 		}
 		timer := time.NewTimer(wait)
 		select {
@@ -363,9 +367,6 @@ func retryRateLimited(ctx context.Context, call func() error) error {
 			timer.Stop()
 			return fmt.Errorf("%w: %w", ctx.Err(), err)
 		case <-timer.C:
-		}
-		if delay < 8*time.Second {
-			delay = min(delay*2, 8*time.Second)
 		}
 	}
 }
