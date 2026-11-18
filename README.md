@@ -12,7 +12,7 @@ Client libraries for market makers integrating with the RiverBit exchange API: o
 | Python | [`python/`](python/) | Not yet |
 | Rust | [`rust/`](rust/) | Not yet |
 
-Each library covers signing, order entry, cancellation, modification, REST queries, bin-ws market data and order events, a local order book and reconciliation helpers. The Go library also persists pending requests to disk and recovers them after a restart; with Python and Rust, persist the signed request yourself before sending it.
+Each library covers signing, order entry, cancellation, modification, request-quota queries and purchases, REST queries, bin-ws market data and order events, a local order book and reconciliation helpers. The Go library also persists pending requests to disk and recovers them after a restart; with Python and Rust, persist the signed request yourself before sending it.
 
 All three implementations follow the same protocol guide, share one Protobuf definition and must reproduce the same golden signing vectors byte for byte.
 
@@ -43,6 +43,7 @@ Every client takes the base URL as configuration; nothing is tied to one environ
 - Keep private keys out of source control, command-line arguments, logs and action files. The libraries never print key material.
 - **Never re-sign an action whose outcome is unknown with a new nonce.** Reconcile it first. The [protocol guide](docs/api-guide.md) explains why and how.
 - Query asset metadata at startup instead of hard-coding asset indexes or precision.
+- Every account has a cumulative request quota that grows with traded volume; requests can also be bought. Monitor it with `userRateLimit`. The guide's section 10.1 has the rules.
 
 ## License
 

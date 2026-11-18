@@ -20,6 +20,7 @@ from .actions import (
     ModifyItem,
     Order,
     Place,
+    ReserveRequestWeight,
     action_type,
 )
 from .errors import UnknownOutcome
@@ -35,6 +36,8 @@ EXCHANGE_TIMEOUT = 20.0
 
 def _leg_count(action_json: bytes) -> int:
     obj = json.loads(action_json)
+    if obj.get("type") == ReserveRequestWeight.TYPE:
+        return 0  # a purchase has no legs
     for key in ("orders", "cancels", "modifies"):
         if isinstance(obj.get(key), list):
             return len(obj[key])
@@ -47,6 +50,10 @@ class ExchangeClient:
     ``base_url`` is explicit (for example ``https://pre-api.riverbit.io``). Orders,
     cancellations and modifications are submitted with REST ``POST /exchange``;
     bin-ws carries market data, order and fill events and queries.
+
+    ``gateway_token`` is an optional gateway credential. When set, every REST request
+    (``/exchange`` and ``/info``) carries it in the ``X-RiverBit-MM-Token`` header; it
+    does not change signing or nonces and is never logged or shown in ``repr``.
 
     ``chain_id`` is ``nextAgentChainId``; if omitted it is fetched once from
     ``chainIdentity``. ``vault_address`` makes every action trade for that vault
@@ -70,6 +77,7 @@ class ExchangeClient:
         timeout: float = EXCHANGE_TIMEOUT,
         source: str = DEFAULT_SOURCE,
         sleep: SleepFn | None = None,
+        gateway_token: str | None = None,
     ) -> None:
         self.signer = signer
         self.chain_id = chain_id
@@ -77,7 +85,13 @@ class ExchangeClient:
         self.nonce_source = nonce_source or shared_nonce_source(signer.address_lower)
         self.timeout = timeout
         self.source = source
-        self._core = HttpCore(base_url, http_client=http_client, timeout=timeout, sleep=sleep)
+        self._core = HttpCore(
+            base_url,
+            http_client=http_client,
+            timeout=timeout,
+            sleep=sleep,
+            gateway_token=gateway_token,
+        )
         self.info = InfoClient(base_url, _core=self._core)
 
     async def __aenter__(self) -> ExchangeClient:
@@ -109,6 +123,7 @@ class ExchangeClient:
         if self.chain_id is None:
             raise RuntimeError("chain_id is unknown: pass chain_id or await load_chain_id() first")
         action_json = action if isinstance(action, bytes) else action.to_json()
+        self._check_purchase_destination(action_json)
         return self.signer.sign_action(
             action_json,
             self.nonce_source.next(),
@@ -116,6 +131,20 @@ class ExchangeClient:
             vault_address=self.vault_address,
             source=self.source,
         )
+
+    def _check_purchase_destination(self, action_json: bytes) -> None:
+        """A vault-paid purchase goes to the vault: refuse another ``destination``."""
+        if self.vault_address is None:
+            return
+        obj = json.loads(action_json)
+        if obj.get("type") == ReserveRequestWeight.TYPE:
+            destination = obj.get("destination")
+            if destination is not None and destination != self.vault_address:
+                raise ValueError(
+                    "with vault_address the vault pays and receives: destination must be "
+                    "absent or equal to the vault; to have the master pay for a vault, use a "
+                    "client without vault_address and set destination to the vault"
+                )
 
     async def prepare(self, action: Action | bytes) -> SignedRequest:
         """:meth:`load_chain_id` if needed, then :meth:`sign`."""
@@ -184,3 +213,13 @@ class ExchangeClient:
 
     async def batch_modify(self, modifies: Sequence[ModifyItem]) -> Receipt:
         return await self.post(BatchModify(list(modifies)))
+
+    async def reserve_request_weight(self, weight: int, destination: str | None = None) -> Receipt:
+        """Buy ``weight`` requests (0.0005 USDC each; see :class:`ReserveRequestWeight`).
+
+        ``destination`` is the account that receives them (default: the payer). Never
+        called by the SDK itself. An :class:`UnknownOutcome` cannot be looked up by
+        oid: compare ``info.user_rate_limit`` before and after, and do not buy again
+        until you know.
+        """
+        return await self.post(ReserveRequestWeight(weight, destination))

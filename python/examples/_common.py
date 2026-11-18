@@ -8,6 +8,8 @@ environment; override them to point at another environment.
     RIVERBIT_WS_URL        bin-ws URL           (default wss://pre-api.riverbit.io/bin-ws)
     RIVERBIT_LOGIN_HOST    login host           (default pre-api.riverbit.io)
     RIVERBIT_VAULT         vault address to trade for (optional)
+    RIVERBIT_MM_TOKEN      gateway credential issued to you (optional); sent as the
+                           X-RiverBit-MM-Token header on REST requests only
 
 The private key is read from a file, never from the command line or the
 environment, so it does not end up in shell history or process listings.
@@ -33,6 +35,7 @@ class Config:
     login_host: str
     signer: Signer
     vault: str | None
+    gateway_token: str | None = None
 
 
 def load_config() -> Config:
@@ -46,4 +49,5 @@ def load_config() -> Config:
         login_host=os.environ.get("RIVERBIT_LOGIN_HOST", PRE_LOGIN_HOST),
         signer=Signer(key),
         vault=os.environ.get("RIVERBIT_VAULT") or None,
+        gateway_token=os.environ.get("RIVERBIT_MM_TOKEN") or None,
     )

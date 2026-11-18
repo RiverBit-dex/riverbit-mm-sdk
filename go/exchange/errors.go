@@ -1,6 +1,7 @@
 package exchange
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -160,6 +161,11 @@ var ambiguousErrHints = []string{"query the order status", "waiting for its trig
 func finalRejection(status string, response, committed json.RawMessage) (int, bool) {
 	if status != "err" {
 		return 0, false
+	}
+	// A quota check runs before anything executes, so a quota rejection is
+	// final even when the reply carries a committedResult member.
+	if bytes.Contains(response, []byte(QuotaRejectionText)) {
+		return CodeRequestQuotaExhausted, true
 	}
 	if len(committed) > 0 && string(committed) != "null" {
 		return 0, committedOrderRejected(committed)

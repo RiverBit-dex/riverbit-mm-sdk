@@ -148,6 +148,7 @@ func (c *Client) trackedExchange(ctx context.Context, action any) error {
 		return err
 	}
 	p := &pendingRequest{Signer: c.SignerAddress(), Transport: c.transportIdentity(), Account: c.AccountAddress(), URL: c.URL, Nonce: nonce, PreparedMs: time.Now().UnixMilli()}
+	purchase := false
 	// A caller-supplied cloid is kept (the caller may cancel or look up by it later);
 	// only orders without one get a random cloid so execution can still be resolved.
 	assign := func(o *Order) error {
@@ -233,10 +234,24 @@ func (c *Client) trackedExchange(ctx context.Context, action any) error {
 		for _, x := range a.Cancels {
 			p.CancelCloids = append(p.CancelCloids, x.Cloid.String())
 		}
+	case ReserveRequestWeight, *ReserveRequestWeight:
+		// A purchase has no legs and no order to look up. Validate before
+		// anything is journaled.
+		r, ok := reserveAction(action)
+		if !ok {
+			return fmt.Errorf("nil reserveRequestWeight action")
+		}
+		if err := c.checkReserve(r); err != nil {
+			return err
+		}
+		if c.SignChainID == 0 {
+			return ErrNoChainID // before anything is journaled
+		}
+		purchase = true
 	default:
 		return fmt.Errorf("%w (got %T)", errUnsupportedAction, action)
 	}
-	if len(p.Lookups)+len(p.CancelOIDs)+len(p.CancelCloids) == 0 {
+	if !purchase && len(p.Lookups)+len(p.CancelOIDs)+len(p.CancelCloids) == 0 {
 		return fmt.Errorf("empty tracked action")
 	}
 	p.Action, err = json.Marshal(action)
@@ -294,7 +309,19 @@ func (c *Client) trackedExchange(ctx context.Context, action any) error {
 		if rej.Code == CodeUnknownSigner {
 			out = fmt.Errorf("%w: %w", out, ErrSignerNotRecognized)
 		}
+		if rej.IsQuotaRejection() {
+			out = fmt.Errorf("%w: %w", out, ErrRequestQuotaExceeded)
+		}
 		return out
+	}
+	if purchase && err == nil {
+		// The purchase was acknowledged: there is nothing to look up.
+		if e := c.retirePending(p, "request_weight_accepted", "reply: status ok, type default"); e != nil {
+			return e
+		}
+		c.LastOrderIDs, c.LastStatuses = nil, nil
+		c.logInfo("request weight purchase accepted; pending cleared", "account", p.Account, "nonce", p.Nonce)
+		return nil
 	}
 	detail := "transport returned; execution unconfirmed"
 	if err != nil {
@@ -541,6 +568,9 @@ func (c *Client) lookupState(ctx context.Context, oid any, requireOrder bool, bi
 
 func (c *Client) resolve(ctx context.Context, p *pendingRequest) error {
 	c.LastOrderIDs, c.LastStatuses = nil, nil
+	if isReserveJournal(p) {
+		return fmt.Errorf("pending nonce=%d retained: %w", p.Nonce, ErrPurchaseUnresolved)
+	}
 	var cancelErrors []string
 	if len(p.CancelReceipt) > 0 {
 		count, err := pendingCancelCount(p)
@@ -789,7 +819,11 @@ func (c *Client) resolve(ctx context.Context, p *pendingRequest) error {
 				}
 				if len(partial.Executed) == 0 {
 					// No leg ran: the request as a whole was rejected.
-					return fmt.Errorf("%w nonce=%d: %s", ErrExecutionRejected, p.Nonce, detail)
+					out := fmt.Errorf("%w nonce=%d: %s", ErrExecutionRejected, p.Nonce, detail)
+					if IsQuotaText(detail) {
+						out = fmt.Errorf("%w: %w", out, ErrRequestQuotaExceeded)
+					}
+					return out
 				}
 				return partial
 			}
@@ -806,6 +840,52 @@ func (c *Client) resolve(ctx context.Context, p *pendingRequest) error {
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+}
+
+// ErrPurchaseUnresolved is the cause of the *UnknownOutcomeError that a pending
+// reserveRequestWeight purchase produces. A purchase has no order to look up, so
+// the SDK cannot resolve it: it stays in the journal and is never resent. The
+// operator compares userRateLimit (nRequestsSurplus and nRequestsUsed) before
+// and after the attempt to decide whether it was applied, then calls
+// AcknowledgePendingPurchase.
+var ErrPurchaseUnresolved = errors.New("a request-weight purchase has an unknown outcome and is never resent: compare userRateLimit (nRequestsSurplus, nRequestsUsed) before and after the attempt to find out whether it was applied, then call AcknowledgePendingPurchase")
+
+func isReserveJournal(p *pendingRequest) bool {
+	var header struct {
+		Type string `json:"type"`
+	}
+	return json.Unmarshal(p.Action, &header) == nil && header.Type == "reserveRequestWeight"
+}
+
+// AcknowledgePendingPurchase retires the pending reserveRequestWeight purchase
+// with this nonce after the operator has decided, by comparing userRateLimit
+// before and after, whether it was applied. It sends nothing and queries
+// nothing; it only writes the audit record (with note) and clears the journal so
+// that new actions are accepted. It fails if the pending request is not a
+// purchase with that nonce. Buy again afterwards only if the comparison showed
+// that the purchase was not applied; a new purchase gets a new nonce.
+func (c *Client) AcknowledgePendingPurchase(nonce uint64, note string) error {
+	if c.StateDir == "" {
+		return fmt.Errorf("no StateDir: there is no journal to acknowledge")
+	}
+	lock := c.signerOperationLock()
+	lock.Lock()
+	defer lock.Unlock()
+	release, err := c.lockDurableSigner()
+	if err != nil {
+		return err
+	}
+	defer release()
+	c.submitMu.Lock()
+	defer c.submitMu.Unlock()
+	p, err := c.loadPending()
+	if err != nil {
+		return err
+	}
+	if p == nil || p.Nonce != nonce || !isReserveJournal(p) {
+		return fmt.Errorf("no pending reserveRequestWeight purchase with nonce %d", nonce)
+	}
+	return c.retirePending(p, "purchase_acknowledged", note)
 }
 
 func inactiveOrder(status string) bool {

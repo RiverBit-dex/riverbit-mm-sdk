@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::cloid::Cloid;
 use crate::decimal::is_decimal_string;
 use crate::error::Error;
+use crate::signing::Address;
 
 /// Time in force for a limit order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -52,6 +53,9 @@ pub enum ActionKind {
     Modify,
     /// `batchModify`
     BatchModify,
+    /// `reserveRequestWeight`: buy request quota. It has no legs and refers
+    /// to no order.
+    ReserveRequestWeight,
 }
 
 impl ActionKind {
@@ -63,6 +67,7 @@ impl ActionKind {
             ActionKind::CancelByCloid => "cancelByCloid",
             ActionKind::Modify => "modify",
             ActionKind::BatchModify => "batchModify",
+            ActionKind::ReserveRequestWeight => "reserveRequestWeight",
         }
     }
 }
@@ -83,6 +88,14 @@ pub trait Action {
     /// The orders this action refers to, for reconciliation after an unknown
     /// outcome.
     fn targets(&self) -> Vec<OrderRef>;
+
+    /// Checks the action against the account it will be sent for: `vault` is
+    /// the vault of the client that signs it, if any. The default accepts
+    /// everything. [`ExchangeClient::prepare`](crate::ExchangeClient::prepare)
+    /// calls it before signing.
+    fn check_account(&self, _vault: Option<&Address>) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// One limit order leg: `{"a","b","p","s","r","t":{"limit":{"tif"}},"c"?}`.
@@ -358,6 +371,94 @@ impl Serialize for BatchModify {
     }
 }
 
+/// The smallest `weight` of a [`ReserveRequestWeight`] purchase.
+pub const MIN_RESERVE_WEIGHT: u64 = 1;
+/// The largest `weight` of a single [`ReserveRequestWeight`] purchase.
+pub const MAX_RESERVE_WEIGHT: u64 = 1_000_000_000;
+/// The price of one request, in micro-USDC (0.0005 USDC).
+pub const REQUEST_PRICE_MICRO_USDC: u64 = 500;
+
+/// The `reserveRequestWeight` action: buy request quota.
+///
+/// Each account has a cumulative cap of ordinary requests (see
+/// [`UserRateLimit`](crate::info::UserRateLimit)); purchased requests add to
+/// it. A request costs 0.0005 USDC, paid by the payer. The purchase itself
+/// does not consume quota.
+///
+/// Without a vault on the client the payer is the signer's account (for an API
+/// wallet, its master account) and `destination` names the account that
+/// receives the requests; absent, the payer receives them. To have the master
+/// pay for a vault, send it from a client **without** `for_vault` and set
+/// `destination` to the vault. With a vault client the vault pays and
+/// receives, so `destination` must be absent or equal to the vault (vault-paid
+/// purchases may be disabled on a network).
+///
+/// Signing and submission are the same as for `order`. The receipt has no
+/// legs: success is `Receipt::default_ack`. An unknown outcome of a purchase
+/// has no order to look up; compare
+/// [`InfoClient::user_rate_limit`](crate::InfoClient::user_rate_limit) before
+/// and after (`nRequestsSurplus` and `nRequestsUsed`), and never sign it again
+/// with a new nonce. The SDK never buys on its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReserveRequestWeight {
+    /// Number of requests to buy, `1..=1_000_000_000`.
+    pub weight: u64,
+    /// The account that receives the requests. `None` means the payer.
+    pub destination: Option<Address>,
+}
+
+impl ReserveRequestWeight {
+    /// Buys `weight` requests for the payer. `weight` is checked when the
+    /// action is serialized.
+    pub fn new(weight: u64) -> Self {
+        ReserveRequestWeight {
+            weight,
+            destination: None,
+        }
+    }
+
+    /// Sends the requests to `destination` instead of the payer.
+    pub fn with_destination(mut self, destination: Address) -> Self {
+        self.destination = Some(destination);
+        self
+    }
+
+    /// The cost in micro-USDC: `weight * 500`, saturating.
+    pub fn cost_micro_usdc(&self) -> u64 {
+        cost_micro_usdc(self.weight)
+    }
+
+    /// Checks `1 <= weight <= 1_000_000_000`.
+    pub fn validate(&self) -> Result<(), Error> {
+        if (MIN_RESERVE_WEIGHT..=MAX_RESERVE_WEIGHT).contains(&self.weight) {
+            Ok(())
+        } else {
+            Err(Error::InvalidInput(format!(
+                "weight {} is outside {MIN_RESERVE_WEIGHT}..={MAX_RESERVE_WEIGHT}",
+                self.weight
+            )))
+        }
+    }
+}
+
+/// The cost of `weight` requests in micro-USDC (`weight * 500`, saturating).
+pub fn cost_micro_usdc(weight: u64) -> u64 {
+    weight.saturating_mul(REQUEST_PRICE_MICRO_USDC)
+}
+
+impl Serialize for ReserveRequestWeight {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let len = 2 + usize::from(self.destination.is_some());
+        let mut st = s.serialize_struct("ReserveRequestWeight", len)?;
+        st.serialize_field("type", "reserveRequestWeight")?;
+        st.serialize_field("weight", &self.weight)?;
+        if let Some(d) = &self.destination {
+            st.serialize_field("destination", &d.to_string())?;
+        }
+        st.end()
+    }
+}
+
 fn non_empty<T>(name: &str, items: &[T]) -> Result<(), Error> {
     if items.is_empty() {
         Err(Error::InvalidInput(format!("{name} must not be empty")))
@@ -466,6 +567,34 @@ impl Action for BatchModify {
     }
 }
 
+impl Action for ReserveRequestWeight {
+    fn kind(&self) -> ActionKind {
+        ActionKind::ReserveRequestWeight
+    }
+    fn to_json(&self) -> Result<String, Error> {
+        self.validate()?;
+        to_json(self)
+    }
+    fn expected_legs(&self) -> Option<usize> {
+        // A purchase has no legs: success is `{"type":"default"}`.
+        None
+    }
+    fn targets(&self) -> Vec<OrderRef> {
+        // No order to look up; see the type documentation.
+        vec![]
+    }
+    fn check_account(&self, vault: Option<&Address>) -> Result<(), Error> {
+        match (vault, &self.destination) {
+            (Some(v), Some(d)) if v != d => Err(Error::InvalidInput(
+                "with a vault client the vault pays and receives: destination must be absent or equal to the vault; \
+                 to have the master pay for a vault, use a client without a vault and set destination"
+                    .into(),
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,5 +686,52 @@ mod tests {
             BatchModify::new(vec![ModifyItem { oid: 5, order }]).targets(),
             vec![OrderRef::Oid(5), OrderRef::Cloid(c)]
         );
+    }
+
+    #[test]
+    fn reserve_request_weight_json_and_validation() {
+        assert_eq!(
+            ReserveRequestWeight::new(1000).to_json().unwrap(),
+            r#"{"type":"reserveRequestWeight","weight":1000}"#
+        );
+        let dest: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            ReserveRequestWeight::new(1000)
+                .with_destination(dest)
+                .to_json()
+                .unwrap(),
+            r#"{"type":"reserveRequestWeight","weight":1000,"destination":"0x2222222222222222222222222222222222222222"}"#
+        );
+        for bad in [0, MAX_RESERVE_WEIGHT + 1, u64::MAX] {
+            assert!(ReserveRequestWeight::new(bad).to_json().is_err(), "{bad}");
+        }
+        for ok in [MIN_RESERVE_WEIGHT, MAX_RESERVE_WEIGHT] {
+            assert!(ReserveRequestWeight::new(ok).to_json().is_ok());
+        }
+        assert_eq!(ReserveRequestWeight::new(1000).cost_micro_usdc(), 500_000);
+        assert_eq!(cost_micro_usdc(u64::MAX), u64::MAX);
+        assert!(ReserveRequestWeight::new(1).targets().is_empty());
+        assert_eq!(ReserveRequestWeight::new(1).expected_legs(), None);
+    }
+
+    #[test]
+    fn reserve_request_weight_destination_must_match_a_vault() {
+        let vault: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let other: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let plain = ReserveRequestWeight::new(5);
+        assert!(plain.check_account(None).is_ok());
+        assert!(plain.check_account(Some(&vault)).is_ok());
+        let to_vault = ReserveRequestWeight::new(5).with_destination(vault);
+        assert!(to_vault.check_account(None).is_ok());
+        assert!(to_vault.check_account(Some(&vault)).is_ok());
+        let to_other = ReserveRequestWeight::new(5).with_destination(other);
+        assert!(to_other.check_account(None).is_ok());
+        assert!(to_other.check_account(Some(&vault)).is_err());
     }
 }

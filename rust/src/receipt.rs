@@ -11,7 +11,7 @@
 use serde_json::Value;
 
 use crate::actions::ActionKind;
-use crate::error::{Error, Rejected, UnknownOutcome, UnknownReason};
+use crate::error::{is_quota_rejection, Error, Rejected, UnknownOutcome, UnknownReason};
 use crate::signing::SignedRequest;
 
 /// The result of one leg of an action (`statuses[i]`).
@@ -111,6 +111,12 @@ impl LegStatus {
     pub fn is_error(&self) -> bool {
         matches!(self, LegStatus::Error(_))
     }
+
+    /// True if this leg was rejected because the request quota is exhausted.
+    /// Nothing executed for it. The text stays in [`LegStatus::Error`].
+    pub fn is_quota_error(&self) -> bool {
+        matches!(self, LegStatus::Error(e) if is_quota_rejection(e))
+    }
 }
 
 /// The parsed reply to a signed action that the exchange accepted for
@@ -123,8 +129,9 @@ pub struct Receipt {
     /// `statuses[]`, one per leg in request order. Empty for the bare
     /// acknowledgment of a single `modify`.
     pub legs: Vec<LegStatus>,
-    /// True for the `{"type":"default"}` acknowledgment of a single `modify`:
-    /// accepted, but not final and without the new oid.
+    /// True for the `{"type":"default"}` acknowledgment of a single `modify`
+    /// (accepted, but not final and without the new oid) and for an accepted
+    /// `reserveRequestWeight` purchase (done: the requests are credited).
     pub default_ack: bool,
     /// The raw reply body.
     pub raw: String,
@@ -145,6 +152,21 @@ impl Receipt {
                 LegStatus::Error(e) => Some((i, e.as_str())),
                 _ => None,
             })
+            .collect()
+    }
+
+    /// Indexes of the legs rejected because the request quota is exhausted.
+    ///
+    /// An action can be partly accepted: the first legs execute normally and
+    /// every later leg carries the quota error. Those legs are final
+    /// rejections, not unknown outcomes. Back off, trade, or buy requests; the
+    /// SDK never retries or buys on its own.
+    pub fn quota_rejected_legs(&self) -> Vec<usize> {
+        self.legs
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.is_quota_error())
+            .map(|(i, _)| i)
             .collect()
     }
 
@@ -234,6 +256,30 @@ pub(crate) fn interpret(body: &[u8], request: &SignedRequest) -> Result<Receipt,
     let response = reply.get("response").unwrap_or(&Value::Null);
 
     match status {
+        "ok" if request.kind() == ActionKind::ReserveRequestWeight => {
+            // A purchase has no legs. `{"type":"default"}` is success; any
+            // error entry is a final rejection (for example code 1801);
+            // anything else proves nothing.
+            if let Some(legs) = statuses_of(response) {
+                let first_error = legs.iter().find_map(|l| match l {
+                    LegStatus::Error(e) => Some(e.clone()),
+                    _ => None,
+                });
+                if let Some(text) = first_error {
+                    return Err(rejected(execution_code(&text), text, legs));
+                }
+                return Err(unknown(UnknownReason::AmbiguousReceipt, legs));
+            }
+            if is_default_ack(response) {
+                return Ok(Receipt {
+                    nonce: request.nonce(),
+                    legs: vec![],
+                    default_ack: true,
+                    raw,
+                });
+            }
+            Err(unknown(UnknownReason::AmbiguousReceipt, vec![]))
+        }
         "ok" => {
             let Some(legs) = statuses_of(response) else {
                 let modify = matches!(request.kind(), ActionKind::Modify | ActionKind::BatchModify);
@@ -276,6 +322,28 @@ pub(crate) fn interpret(body: &[u8], request: &SignedRequest) -> Result<Receipt,
             })
         }
         "err" => {
+            // A quota rejection is decided at ingress, before anything runs,
+            // so it is final even when the reply carries an extra
+            // `committedResult` (seen on `modify`). If that result holds a leg
+            // that is not an error, fall through to the careful path.
+            if let Some(text) = response.as_str().filter(|t| is_quota_rejection(t)) {
+                // A committed result without `statuses` carries no leg that
+                // could have executed; one with a live leg is not plain.
+                let committed_legs = reply
+                    .get("committedResult")
+                    .filter(|c| !c.is_null())
+                    .and_then(statuses_of)
+                    .unwrap_or_default();
+                let legs = committed_legs
+                    .iter()
+                    .all(LegStatus::is_error)
+                    .then_some(committed_legs);
+                if let Some(legs) = legs {
+                    if !is_duplicate(text) {
+                        return Err(rejected(execution_code(text), text.to_string(), legs));
+                    }
+                }
+            }
             if let Some(committed) = reply.get("committedResult").filter(|c| !c.is_null()) {
                 // Effects may already exist. Only a result made of plain,
                 // terminal errors proves that nothing executed.
@@ -542,6 +610,102 @@ mod tests {
         let one =
             br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"a"}]}}}"#;
         assert!(!interpret(one, &req).unwrap().all_ok());
+    }
+
+    const QUOTA: &str = "Too many cumulative requests sent (10045 > 10025) for cumulative volume traded $25.88. Place taker orders to free up 1 request per USDC traded.";
+
+    #[test]
+    fn partly_accepted_action_keeps_quota_legs_in_the_receipt() {
+        let body = format!(
+            r#"{{"status":"ok","response":{{"type":"order","data":{{"statuses":[{{"resting":{{"oid":5}}}},{{"error":"action rejected by execution (code 1800) ({QUOTA})"}},{{"error":"{QUOTA}"}}]}}}}}}"#
+        );
+        let r = interpret(body.as_bytes(), &place(3)).unwrap();
+        assert_eq!(r.quota_rejected_legs(), vec![1, 2]);
+        assert!(r.legs[1].is_quota_error() && !r.legs[0].is_quota_error());
+        // A cancel leg appends the asset.
+        let cancel = LegStatus::Error(format!("{QUOTA} asset=3"));
+        assert!(cancel.is_quota_error());
+    }
+
+    #[test]
+    fn modify_quota_rejection_is_final_even_with_committed_result() {
+        let req = request(&Modify {
+            oid: 5,
+            order: Order::limit(1, true, "1", "1", Tif::Alo),
+        });
+        for extra in [
+            "",
+            r#","committedResult":null"#,
+            r#","committedResult":{"unexpected":true}"#,
+            r#","committedResult":{"type":"order","data":{"statuses":[{"error":"x"}]}}"#,
+        ] {
+            let body = format!(r#"{{"status":"err","response":"{QUOTA}"{extra}}}"#);
+            let e = interpret(body.as_bytes(), &req).unwrap_err();
+            assert!(e.is_quota_exhausted(), "{extra}");
+            assert!(!e.is_unknown_outcome(), "{extra}");
+            assert!(e.as_rejected().unwrap().message.contains("10045 > 10025"));
+        }
+        // Wrapped forms carry the code.
+        let body = format!(
+            r#"{{"status":"err","response":"action rejected at ingress (code 1800) ({QUOTA})"}}"#
+        );
+        let e = interpret(body.as_bytes(), &req).unwrap_err();
+        assert_eq!(e.as_rejected().unwrap().code, None);
+        assert!(e.is_quota_exhausted());
+        let body = format!(
+            r#"{{"status":"err","response":"action rejected by execution (code 1800) ({QUOTA})"}}"#
+        );
+        let r = interpret(body.as_bytes(), &req).unwrap_err();
+        assert_eq!(r.as_rejected().unwrap().code, Some(1800));
+        // A committed result that holds a live order is not a plain rejection.
+        let body = format!(
+            r#"{{"status":"err","response":"{QUOTA}","committedResult":{{"type":"order","data":{{"statuses":[{{"resting":{{"oid":3}}}}]}}}}}}"#
+        );
+        assert!(interpret(body.as_bytes(), &req)
+            .unwrap_err()
+            .is_unknown_outcome());
+        // Other rejections are not quota rejections.
+        let body = br#"{"status":"err","response":"Attempted to modify to invalid new order"}"#;
+        assert!(!interpret(body, &req).unwrap_err().is_quota_exhausted());
+    }
+
+    fn purchase() -> SignedRequest {
+        request(&crate::actions::ReserveRequestWeight::new(1000))
+    }
+
+    #[test]
+    fn purchase_receipts() {
+        let r = interpret(
+            br#"{"status":"ok","response":{"type":"default"}}"#,
+            &purchase(),
+        )
+        .unwrap();
+        assert!(r.default_ack && r.legs.is_empty() && r.all_ok());
+        // `err` is a final rejection, with or without a code.
+        let e = interpret(
+            br#"{"status":"err","response":"insufficient balance"}"#,
+            &purchase(),
+        )
+        .unwrap_err();
+        assert!(e.as_rejected().is_some());
+        // An overflow arrives as a per-leg error inside an `ok` reply.
+        let body = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"action rejected by execution (code 1801) (reserved request weight would overflow)"}]}}}"#;
+        let e = interpret(body, &purchase()).unwrap_err();
+        let r = e.as_rejected().unwrap();
+        assert_eq!(r.code, Some(1801));
+        assert!(r.is_purchase_overflow() && !r.is_quota_exhausted());
+        // Anything else proves nothing.
+        for body in [
+            &br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":1}}]}}}"#[..],
+            &br#"{"status":"ok","response":{"type":"default","extra":1}}"#[..],
+            &br#"{"status":"ok","response":"done"}"#[..],
+            &br#"not json"#[..],
+            &br#"{"status":"err","response":"action already pending"}"#[..],
+            &br#"{"status":"err","response":"action rejected by execution (code 205): dup"}"#[..],
+        ] {
+            let e = interpret(body, &purchase()).unwrap_err();
+            assert!(e.is_unknown_outcome(), "{}", String::from_utf8_lossy(body));
+        }
     }
 
     #[test]

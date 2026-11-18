@@ -42,8 +42,7 @@ async fn main() {
         .subscribe(&Subscription::order_updates(&master))
         .await
         .expect("subscribe");
-    let exchange = ExchangeClient::new(&env.base_url, env.signer.clone(), domain)
-        .expect("build the exchange client");
+    let exchange: ExchangeClient = env.exchange(domain);
 
     let order =
         Order::limit(asset, true, price, size, Tif::Alo).with_cloid(Cloid::random().unwrap());

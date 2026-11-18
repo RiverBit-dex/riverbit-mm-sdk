@@ -14,6 +14,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
+from .signing import normalize_address
+
 _CLOID_RE = re.compile(r"^0x[0-9a-f]{32}$")
 _TIFS = ("Alo", "Gtc")
 
@@ -232,6 +234,65 @@ class BatchModify(_ActionBase):
 
     def to_obj(self) -> dict[str, Any]:
         return {"type": self.TYPE, "modifies": [m.to_obj() for m in self.modifies]}
+
+
+#: Smallest and largest ``weight`` of a request purchase.
+MIN_RESERVE_WEIGHT = 1
+MAX_RESERVE_WEIGHT = 1_000_000_000
+#: Price of one purchased request, in micro-USDC (0.0005 USDC).
+REQUEST_PRICE_MICRO_USDC = 500
+
+
+def reserve_cost_micro_usdc(weight: int) -> int:
+    """Cost in micro-USDC (1e-6 USDC) of buying ``weight`` requests: ``weight * 500``."""
+    return weight * REQUEST_PRICE_MICRO_USDC
+
+
+@dataclass(frozen=True)
+class ReserveRequestWeight(_ActionBase):
+    """The ``reserveRequestWeight`` action: buy request quota.
+
+    ``weight`` is the number of requests to buy, an integer
+    (``1 <= weight <= 1_000_000_000``) sent as a JSON number. ``destination`` is the
+    account that receives them; absent means the payer. The payer pays 0.0005 USDC
+    per request (:func:`reserve_cost_micro_usdc`).
+
+    Without a vault the payer is the signer's account (an API wallet pays from its
+    master). To have the master pay for a vault, use a client **without** a vault
+    and set ``destination`` to the vault. With ``vault_address`` on the client the
+    vault pays and receives, so ``destination`` must be absent or equal to the vault
+    (vault-paid purchases may be disabled on a network).
+
+    A purchase has no legs, no oid and no cloid, so nothing can be looked up after
+    an :class:`~riverbit_mm.UnknownOutcome`: compare ``userRateLimit`` before and
+    after instead. A purchase does not consume quota itself.
+    """
+
+    weight: int
+    destination: str | None = None
+    TYPE: ClassVar[str] = "reserveRequestWeight"
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.weight, bool)
+            or not isinstance(self.weight, int)
+            or not MIN_RESERVE_WEIGHT <= self.weight <= MAX_RESERVE_WEIGHT
+        ):
+            raise ValueError(
+                f"weight must be an integer in [{MIN_RESERVE_WEIGHT}, {MAX_RESERVE_WEIGHT}]"
+            )
+        if self.destination is not None:
+            object.__setattr__(self, "destination", normalize_address(self.destination))
+
+    @property
+    def cost_micro_usdc(self) -> int:
+        return reserve_cost_micro_usdc(self.weight)
+
+    def to_obj(self) -> dict[str, Any]:
+        obj: dict[str, Any] = {"type": self.TYPE, "weight": self.weight}
+        if self.destination is not None:
+            obj["destination"] = self.destination
+        return obj
 
 
 def action_type(action_json: bytes) -> str:

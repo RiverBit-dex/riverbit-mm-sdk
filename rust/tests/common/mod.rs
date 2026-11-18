@@ -22,6 +22,18 @@ pub const TEST_KEY: &str = "0x01010101010101010101010101010101010101010101010101
 pub struct HttpRequest {
     pub path: String,
     pub body: Vec<u8>,
+    /// Header names are lowercase.
+    pub headers: Vec<(String, String)>,
+}
+
+impl HttpRequest {
+    /// The value of the first header called `name` (lowercase).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 pub struct HttpReply {
@@ -115,7 +127,17 @@ where
         }
         let body = buf[header_end..header_end + length].to_vec();
         buf.drain(..header_end + length);
-        let request = HttpRequest { path, body };
+        let headers = head
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_once(':'))
+            .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .collect();
+        let request = HttpRequest {
+            path,
+            body,
+            headers,
+        };
         let index = {
             let mut log = log.lock().unwrap();
             log.push(request.clone());

@@ -3,6 +3,7 @@ package exchange
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -88,4 +89,8 @@ func (b *cloidBook) get(cloid string) (Order, bool) {
 	defer b.mu.Unlock()
 	o, ok := b.orders[cloid]
 	return o, ok
+}
+
+func newBufferLogger(w *strings.Builder) *slog.Logger {
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }

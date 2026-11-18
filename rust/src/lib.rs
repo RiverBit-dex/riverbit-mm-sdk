@@ -21,15 +21,18 @@ pub mod transport;
 
 pub use actions::{
     Action, ActionKind, BatchModify, Cancel, CancelByCloid, CancelByCloidItem, CancelItem, Modify,
-    ModifyItem, Order, OrderRef, Place, Tif,
+    ModifyItem, Order, OrderRef, Place, ReserveRequestWeight, Tif,
 };
 pub use binws::{BinWsConfig, BinWsSession, Event, Events, ReconnectPolicy};
 pub use book::Book;
 pub use cloid::Cloid;
-pub use error::{Error, Rejected, Result, UnknownOutcome, UnknownReason};
+pub use error::{
+    is_quota_rejection, Error, Rejected, Result, UnknownOutcome, UnknownReason,
+    CODE_PURCHASE_OVERFLOW, CODE_QUOTA_EXHAUSTED, QUOTA_REJECTION_TEXT,
+};
 pub use exchange::ExchangeClient;
 pub use frames::{Frame, JsonFrame};
-pub use info::InfoClient;
+pub use info::{InfoClient, UserRateLimit};
 pub use nonce::NonceSource;
 pub use receipt::{LegStatus, Receipt};
 pub use reconcile::{reconcile, reconcile_orders, OrderReport};

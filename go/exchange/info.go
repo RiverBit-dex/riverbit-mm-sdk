@@ -20,6 +20,8 @@ type InfoClient struct {
 	URL string
 	// HTTP is the HTTP client; nil uses a client with a 15 second timeout.
 	HTTP *http.Client
+
+	token *gatewayToken // optional gateway credential; see SetGatewayCredential
 }
 
 // NewInfoClient returns an InfoClient for the REST base URL.
@@ -31,7 +33,7 @@ func NewInfoClient(baseURL string) *InfoClient {
 // body is usually a map or struct with a "type" member, for example
 // {"type":"openOrders","user":"0x..."}.
 func (c *InfoClient) Query(ctx context.Context, body, out any) error {
-	return retryRateLimited(ctx, func() error { return postJSON(ctx, c.http(), c.URL, "/info", body, out) })
+	return retryRateLimited(ctx, func() error { return postJSON(ctx, c.http(), c.URL, "/info", body, out, c.token) })
 }
 
 // Check verifies that /info is reachable by sending a meta query.
@@ -158,12 +160,12 @@ func (c *InfoClient) OpenOrders(ctx context.Context, user string) ([]OpenOrder, 
 // postJSON POSTs body as JSON to base+path and decodes a 200 answer into out.
 // Any other status is an error; 429 is a *RateLimitError. For /exchange a
 // non-200 answer means the outcome is unknown, not rejected.
-func postJSON(ctx context.Context, client *http.Client, base, path string, body, out any) error {
+func postJSON(ctx context.Context, client *http.Client, base, path string, body, out any, token *gatewayToken) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	return postRaw(ctx, client, base, path, data, out)
+	return postRaw(ctx, client, base, path, data, out, token)
 }
 
 // noRedirect makes an http.Client return a 3xx answer as is instead of
@@ -174,12 +176,13 @@ func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastRe
 // when the caller's client would: a signed body must go only to the URL it was
 // built for, and a 3xx answer counts as a failed request (for /exchange, an
 // unknown outcome, since the body already left the process).
-func postRaw(ctx context.Context, client *http.Client, base, path string, data []byte, out any) error {
+func postRaw(ctx context.Context, client *http.Client, base, path string, data []byte, out any, token *gatewayToken) error {
 	req, err := http.NewRequestWithContext(ctx, "POST", base+path, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	token.apply(req)
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}

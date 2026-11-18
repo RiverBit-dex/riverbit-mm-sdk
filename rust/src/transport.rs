@@ -9,7 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use reqwest::header::RETRY_AFTER;
+use reqwest::header::{HeaderName, HeaderValue, RETRY_AFTER};
 
 /// A boxed, sendable future.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -66,11 +66,48 @@ pub trait InfoTransport: Send + Sync {
 
 const MAX_BODY: usize = 16 << 20;
 
-/// The REST side: one HTTP client and a base URL.
-#[derive(Clone, Debug)]
+/// The header that carries the optional gateway credential.
+pub(crate) const TOKEN_HEADER: HeaderName = HeaderName::from_static("x-riverbit-mm-token");
+
+/// Validates a gateway credential for use as a header value. An empty string
+/// means "no credential". The error never contains the credential.
+pub(crate) fn parse_gateway_token(token: &str) -> Result<Option<HeaderValue>, crate::error::Error> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    // Visible ASCII only: no CR, LF, other control characters or non-ASCII.
+    if !token.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return Err(crate::error::Error::InvalidInput(
+            "the gateway credential must be visible ASCII without spaces or control characters (it is sent as an HTTP header value)"
+                .into(),
+        ));
+    }
+    let mut value = HeaderValue::from_str(token).map_err(|_| {
+        crate::error::Error::InvalidInput(
+            "the gateway credential is not a valid HTTP header value".into(),
+        )
+    })?;
+    value.set_sensitive(true);
+    Ok(Some(value))
+}
+
+/// The REST side: one HTTP client, a base URL and an optional gateway
+/// credential. The credential goes only to this base URL and never shows up
+/// in `Debug` output.
+#[derive(Clone)]
 pub(crate) struct Rest {
     http: reqwest::Client,
     base: String,
+    token: Option<HeaderValue>,
+}
+
+impl std::fmt::Debug for Rest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rest")
+            .field("base", &self.base)
+            .field("gateway_token", &self.token.is_some())
+            .finish()
+    }
 }
 
 pub(crate) struct RestReply {
@@ -99,7 +136,22 @@ impl Rest {
         Ok(Rest {
             http,
             base: base_url.trim_end_matches('/').to_string(),
+            token: None,
         })
+    }
+
+    /// Sets (or, for an empty string, clears) the gateway credential.
+    pub(crate) fn set_token(&mut self, token: &str) -> Result<(), crate::error::Error> {
+        self.token = parse_gateway_token(token)?;
+        Ok(())
+    }
+
+    pub(crate) fn base(&self) -> &str {
+        &self.base
+    }
+
+    pub(crate) fn has_token(&self) -> bool {
+        self.token.is_some()
     }
 
     /// POSTs `body` unchanged to `<base><path>`.
@@ -110,15 +162,16 @@ impl Rest {
         timeout: Duration,
     ) -> Result<RestReply, TransportError> {
         let url = format!("{}{path}", self.base);
-        let response = self
+        let mut request = self
             .http
             .post(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .timeout(timeout)
-            .body(body.to_vec())
-            .send()
-            .await
-            .map_err(map_reqwest)?;
+            .body(body.to_vec());
+        if let Some(token) = &self.token {
+            request = request.header(TOKEN_HEADER, token.clone());
+        }
+        let response = request.send().await.map_err(map_reqwest)?;
         // A caller-supplied client may follow redirects. The body is already
         // gone then; refuse to treat the answer as the answer of this URL.
         let sent_to =
@@ -216,6 +269,34 @@ impl InfoTransport for RestInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_token_validation() {
+        assert!(parse_gateway_token("").unwrap().is_none());
+        assert!(parse_gateway_token("abc.DEF-123_~").unwrap().is_some());
+        for bad in [
+            "a\r\nb",
+            "a\nb",
+            "a b",
+            "tok\u{e9}n",
+            "a\tb",
+            "a\0b",
+            "\u{7f}",
+        ] {
+            let err = parse_gateway_token(bad).unwrap_err().to_string();
+            assert!(!err.contains(bad.trim()) || bad.trim().is_empty(), "{err}");
+        }
+    }
+
+    #[test]
+    fn rest_debug_hides_the_token() {
+        let mut rest = Rest::new("https://example.invalid/", None).unwrap();
+        rest.set_token("super-secret-credential").unwrap();
+        assert!(rest.has_token());
+        let shown = format!("{rest:?}");
+        assert!(!shown.contains("super-secret-credential"), "{shown}");
+        assert!(shown.contains("true"));
+    }
 
     #[test]
     fn retry_after_seconds() {

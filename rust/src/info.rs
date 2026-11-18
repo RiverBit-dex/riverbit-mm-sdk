@@ -289,6 +289,59 @@ pub struct CandleRequest {
     pub end_time: u64,
 }
 
+/// `userRateLimit`: the request quota of a master account or vault.
+///
+/// The cap is `10000 + floor(cumVlm)` ordinary requests; purchased requests
+/// are not part of it. At most one of `n_requests_used` and
+/// `n_requests_surplus` is above zero: `used` is `max(0, used - purchased)` and
+/// `surplus` is `max(0, purchased - used)`. A node that cannot answer replies
+/// with HTTP 501, which is reported as [`Error::Http`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserRateLimit {
+    /// Cumulative traded volume in USD, a decimal string (kept as a string).
+    pub cum_vlm: String,
+    /// The cap for ordinary actions, purchased requests not included.
+    pub n_requests_cap: u64,
+    /// `max(0, used - purchased)`.
+    pub n_requests_used: u64,
+    /// `max(0, purchased - used)`.
+    pub n_requests_surplus: u64,
+}
+
+impl UserRateLimit {
+    /// Requests left before the account is rejected:
+    /// `max(0, cap - used) + surplus`, with saturating arithmetic.
+    pub fn remaining(&self) -> u64 {
+        self.n_requests_cap
+            .saturating_sub(self.n_requests_used)
+            .saturating_add(self.n_requests_surplus)
+    }
+
+    fn from_value(v: &Value) -> Result<Self> {
+        let count = |name: &str| -> Result<u64> {
+            match &v[name] {
+                Value::Number(n) => n.as_u64(),
+                Value::String(s) => s.trim().parse::<u64>().ok(),
+                _ => None,
+            }
+            .ok_or_else(|| {
+                Error::Decode(format!("userRateLimit: {name} is not an unsigned integer"))
+            })
+        };
+        let cum_vlm = match &v["cumVlm"] {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            _ => return Err(Error::Decode("userRateLimit: cumVlm is missing".into())),
+        };
+        Ok(UserRateLimit {
+            cum_vlm,
+            n_requests_cap: count("nRequestsCap")?,
+            n_requests_used: count("nRequestsUsed")?,
+            n_requests_surplus: count("nRequestsSurplus")?,
+        })
+    }
+}
+
 /// Query types that must use REST, never bin-ws `info_json`.
 const REST_ONLY: [&str; 3] = ["metaAndAssetCtxs", "userRole", "leadingVaults"];
 
@@ -300,6 +353,7 @@ const REST_ONLY: [&str; 3] = ["metaAndAssetCtxs", "userRole", "leadingVaults"];
 /// read-only node that can trail REST by up to two blocks.
 #[derive(Clone)]
 pub struct InfoClient {
+    rest_config: Rest,
     rest: Arc<dyn InfoTransport>,
     queries: Option<Arc<dyn InfoTransport>>,
     max_retries: u32,
@@ -317,13 +371,34 @@ impl InfoClient {
         let rest = Rest::new(base_url, http)?;
         Ok(InfoClient {
             rest: Arc::new(RestInfo {
-                rest,
+                rest: rest.clone(),
                 timeout: Duration::from_secs(15),
             }),
+            rest_config: rest,
             queries: None,
             max_retries: 3,
             max_retry_wait: Duration::from_secs(60),
         })
+    }
+
+    /// Sets the optional gateway credential. Every REST request of this
+    /// client then carries it in the `X-RiverBit-MM-Token` header. An empty
+    /// string clears it. It is never sent over bin-ws (queries routed with
+    /// [`with_bin_ws`](Self::with_bin_ws) do not carry it), never logged and
+    /// never part of `Debug` or error output. Characters that are not valid in
+    /// a header value (CR, LF, spaces, non-ASCII) are rejected here.
+    ///
+    /// If you supply your own `reqwest` client, it must not follow redirects,
+    /// or the credential would go to the redirect target. The default client
+    /// does not. The credential only lifts gateway rate limits: it changes
+    /// nothing about signing, and a wrong one is treated as none.
+    pub fn with_gateway_token(mut self, token: &str) -> Result<Self> {
+        self.rest_config.set_token(token)?;
+        self.rest = Arc::new(RestInfo {
+            rest: self.rest_config.clone(),
+            timeout: Duration::from_secs(15),
+        });
+        Ok(self)
     }
 
     /// Routes the queries that bin-ws serves over the session's `info_json`.
@@ -389,6 +464,17 @@ impl InfoClient {
             .query(&json!({"type": "userRole", "user": user.to_string()}))
             .await?;
         Ok(UserRole::from_value(v))
+    }
+
+    /// `userRateLimit`: the request quota of a master account or a vault
+    /// (not an API wallet). See [`UserRateLimit::remaining`]. Use it to see
+    /// how many requests are left, and to compare before and after an unknown
+    /// `reserveRequestWeight` purchase.
+    pub async fn user_rate_limit(&self, user: &Address) -> Result<UserRateLimit> {
+        let v = self
+            .query(&json!({"type": "userRateLimit", "user": user.to_string()}))
+            .await?;
+        UserRateLimit::from_value(&v)
     }
 
     /// `leadingVaults`: vaults led by a master account. REST only.
@@ -469,9 +555,52 @@ impl InfoClient {
     }
 }
 
+impl std::fmt::Debug for InfoClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InfoClient")
+            .field("base", &self.rest_config.base())
+            .field("gateway_token", &self.rest_config.has_token())
+            .field("bin_ws", &self.queries.is_some())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_user_rate_limit() {
+        let v =
+            json!({"cumVlm":"25.88","nRequestsCap":10025,"nRequestsSurplus":0,"nRequestsUsed":45});
+        let q = UserRateLimit::from_value(&v).unwrap();
+        assert_eq!(q.cum_vlm, "25.88");
+        assert_eq!(q.remaining(), 10025 - 45);
+        // Counts as decimal strings, and the full u64 range.
+        let v = json!({"cumVlm":"0","nRequestsCap":"18446744073709551615","nRequestsSurplus":"5","nRequestsUsed":0});
+        let q = UserRateLimit::from_value(&v).unwrap();
+        assert_eq!(q.n_requests_cap, u64::MAX);
+        assert_eq!(q.remaining(), u64::MAX, "saturates");
+        // Used above the cap: only the surplus is left (zero here).
+        let q = UserRateLimit {
+            cum_vlm: "0".into(),
+            n_requests_cap: 10,
+            n_requests_used: 25,
+            n_requests_surplus: 0,
+        };
+        assert_eq!(q.remaining(), 0);
+        let q = UserRateLimit {
+            n_requests_used: 0,
+            n_requests_surplus: 7,
+            ..q
+        };
+        assert_eq!(q.remaining(), 17);
+        assert!(UserRateLimit::from_value(&json!({"cumVlm":"1"})).is_err());
+        assert!(UserRateLimit::from_value(
+            &json!({"cumVlm":"1","nRequestsCap":-1,"nRequestsSurplus":0,"nRequestsUsed":0})
+        )
+        .is_err());
+    }
 
     #[test]
     fn parses_order_status_variants() {

@@ -119,7 +119,7 @@ func LimitOrder(asset int, buy bool, price, size, tif string) Order {
 }
 
 // ParseAction decodes a JSON action of any supported type into its typed
-// form (*Place, *Cancel, *CancelByCloid, *Modify or *BatchModify), selected by
+// form (*Place, *Cancel, *CancelByCloid, *Modify, *BatchModify or *ReserveRequestWeight), selected by
 // the "type" member. Unknown members are ignored, so re-marshal the result
 // rather than sending the input bytes if you need the canonical key order.
 func ParseAction(raw []byte) (any, error) {
@@ -141,6 +141,8 @@ func ParseAction(raw []byte) (any, error) {
 		action = &Modify{}
 	case "batchModify":
 		action = &BatchModify{}
+	case "reserveRequestWeight":
+		action = &ReserveRequestWeight{}
 	default:
 		return nil, fmt.Errorf("unsupported action type %q", head.Type)
 	}

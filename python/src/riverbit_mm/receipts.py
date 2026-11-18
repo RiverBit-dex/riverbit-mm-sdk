@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .errors import ActionRejected, UnknownOutcome
+from .errors import QUOTA_EXHAUSTED_CODE, ActionRejected, UnknownOutcome, is_quota_error
 from .signing import SignedRequest
 
 LegKind = Literal[
@@ -49,6 +50,11 @@ class Leg:
         """True for a leg that was accepted (it may still have a resting remainder)."""
         return self.kind in _OK_KINDS
 
+    @property
+    def quota_exhausted(self) -> bool:
+        """True if this leg was rejected for the request quota (final: nothing executed)."""
+        return self.kind == "error" and is_quota_error(self.error)
+
 
 @dataclass(frozen=True)
 class Receipt:
@@ -88,6 +94,12 @@ class Receipt:
     @property
     def failed(self) -> tuple[Leg, ...]:
         return tuple(leg for leg in self.legs if not leg.ok)
+
+    @property
+    def quota_rejected(self) -> tuple[Leg, ...]:
+        """The legs rejected for the request quota. An action can be partly accepted:
+        the first legs execute and every later leg carries the quota error."""
+        return tuple(leg for leg in self.legs if leg.quota_exhausted)
 
     @property
     def all_ok(self) -> bool:
@@ -141,6 +153,24 @@ def _is_precision_exceeded(statuses: list[Any]) -> bool:
     return isinstance(error, str) and "PrecisionExceeded" in error
 
 
+def _reject_or_unknown(
+    text: str, raw: Any, *, request: SignedRequest, unknown: Callable[[str], UnknownOutcome]
+) -> ActionRejected:
+    """The :class:`ActionRejected` for a rejection text, or raise :class:`UnknownOutcome`
+    when the text says the outcome is not settled (ambiguous hint, duplicate nonce)."""
+    lowered = (text + json.dumps(raw)).lower()
+    quota = is_quota_error(text)
+    if not quota and any(hint in lowered for hint in _AMBIGUOUS_HINTS):
+        raise unknown(f"node asks to query before deciding: {text[:300]}")
+    match = _CODE_RE.search(text)
+    code = int(match.group(1)) if match else None
+    if code is None and quota:
+        code = QUOTA_EXHAUSTED_CODE
+    if code in _UNSETTLED_CODES:
+        raise unknown(f"duplicate nonce (code {code}): the original request may have executed")
+    return ActionRejected(text[:500], code=code, nonce=request.nonce, response=raw, request=request)
+
+
 def interpret_reply(
     result: Any,
     *,
@@ -156,6 +186,13 @@ def interpret_reply(
     duplicate nonce (code 205) or ``action already pending``, a receipt with a
     different number of statuses than the action has legs (except the lone
     ``PrecisionExceeded`` status), or a leg that is malformed or lacks its oid.
+
+    A request-quota rejection is final: per leg it is a ``Leg`` with
+    :attr:`Leg.quota_exhausted`, for a whole action (``modify``) it raises
+    :class:`ActionRejected` with ``quota_exhausted`` true, even if the reply also
+    carries a ``committedResult``. A ``reserveRequestWeight`` purchase has no legs
+    (``expected_legs == 0``): ``ok`` with ``{"type":"default"}`` is a receipt with
+    ``acknowledged`` true, any error entry or an ``err`` reply is a rejection.
     """
 
     def unknown(reason: str) -> UnknownOutcome:
@@ -186,6 +223,21 @@ def interpret_reply(
             raise unknown(f"receipt leg(s) {bad} are malformed or carry no oid")
         return legs
 
+    if action_type == "reserveRequestWeight" and status == "ok":
+        statuses = _statuses(response)
+        if statuses is not None:
+            errors = [
+                e["error"]
+                for e in statuses
+                if isinstance(e, dict) and isinstance(e.get("error"), str)
+            ]
+            if errors:
+                raise _reject_or_unknown(errors[0], result, request=request, unknown=unknown)
+            raise unknown("purchase reply carries statuses without an error")
+        if isinstance(response, dict) and response.get("type") == "default":
+            return Receipt("ok", request, (), 0, True, result)
+        raise unknown("accepted purchase reply is not the default answer")
+
     if status == "ok":
         statuses = _statuses(response)
         if statuses is not None:
@@ -196,25 +248,17 @@ def interpret_reply(
 
     if status == "err":
         committed = result.get("committedResult")
-        if committed is not None:
+        text = response if isinstance(response, str) else json.dumps(response)
+        # A quota rejection is final even when a committedResult member is present.
+        if (
+            committed is not None
+            and action_type != "reserveRequestWeight"
+            and not is_quota_error(text)
+        ):
             statuses = _statuses(committed)
             if statuses is None:
                 raise unknown("error reply with an unparseable committedResult")
             return Receipt("err", request, legs_of(statuses), expected_legs, False, result)
-        text = response if isinstance(response, str) else json.dumps(response)
-        lowered = (text + json.dumps(result)).lower()
-        if any(hint in lowered for hint in _AMBIGUOUS_HINTS):
-            raise unknown(f"node asks to query before deciding: {text[:300]}")
-        match = _CODE_RE.search(text)
-        code = int(match.group(1)) if match else None
-        if code in _UNSETTLED_CODES:
-            raise unknown(f"duplicate nonce (code {code}): the original request may have executed")
-        raise ActionRejected(
-            text[:500],
-            code=code,
-            nonce=request.nonce,
-            response=response,
-            request=request,
-        )
+        raise _reject_or_unknown(text, result, request=request, unknown=unknown)
 
     raise unknown(f"unexpected reply status {status!r}")

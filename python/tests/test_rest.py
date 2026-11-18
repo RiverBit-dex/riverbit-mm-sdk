@@ -480,3 +480,272 @@ async def test_all_action_kinds_submit() -> None:
     assert types == [
         "cancelByCloid", "batchModify", "cancel", "cancelByCloid", "modify", "batchModify",
     ]  # fmt: skip
+
+
+# ---------------------------------------------------------------- request quota
+
+QUOTA_TEXT = (
+    "Too many cumulative requests sent (10045 > 10025) for cumulative volume traded $25.88. "
+    "Place taker orders to free up 1 request per USDC traded."
+)
+
+
+async def test_user_rate_limit_query_and_remaining() -> None:
+    rec = Recorder(
+        jr({"cumVlm": "25.88", "nRequestsCap": 10025, "nRequestsSurplus": 0, "nRequestsUsed": 45})
+    )
+    async with InfoClient(BASE, http_client=client_for(rec)) as info:
+        quota = await info.user_rate_limit(USER)
+    assert json.loads(rec.requests[0].content) == {"type": "userRateLimit", "user": USER}
+    assert quota.cum_vlm == "25.88" and quota.requests_cap == 10025
+    assert quota.requests_used == 45 and quota.requests_surplus == 0
+    assert quota.remaining == 9980
+
+
+def test_user_rate_limit_remaining_saturates_and_adds_surplus() -> None:
+    from riverbit_mm import parse_user_rate_limit
+
+    over = parse_user_rate_limit(
+        {"cumVlm": "0", "nRequestsCap": 10, "nRequestsUsed": 25, "nRequestsSurplus": 0}
+    )
+    assert over.remaining == 0
+    bought = parse_user_rate_limit(
+        {"cumVlm": "0", "nRequestsCap": 10, "nRequestsUsed": 0, "nRequestsSurplus": "500"}
+    )
+    assert bought.remaining == 510 and bought.requests_surplus == 500
+    big = parse_user_rate_limit(
+        {
+            "cumVlm": "1",
+            "nRequestsCap": 2**64 - 1,
+            "nRequestsUsed": 0,
+            "nRequestsSurplus": 2**64 - 1,
+        }
+    )
+    assert big.remaining == 2 * (2**64 - 1)  # Python ints do not wrap
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        [],
+        {"cumVlm": 5, "nRequestsCap": 1, "nRequestsUsed": 0, "nRequestsSurplus": 0},
+        {"cumVlm": "5", "nRequestsCap": -1, "nRequestsUsed": 0, "nRequestsSurplus": 0},
+        {"cumVlm": "5", "nRequestsCap": 2**64, "nRequestsUsed": 0, "nRequestsSurplus": 0},
+        {"cumVlm": "5", "nRequestsCap": True, "nRequestsUsed": 0, "nRequestsSurplus": 0},
+        {"cumVlm": "5", "nRequestsCap": 1, "nRequestsUsed": "x", "nRequestsSurplus": 0},
+        {"cumVlm": "5", "nRequestsCap": 1, "nRequestsUsed": 0},
+    ],
+)
+def test_user_rate_limit_rejects_malformed_answers(answer: Any) -> None:
+    from riverbit_mm import ProtocolError, parse_user_rate_limit
+
+    with pytest.raises(ProtocolError):
+        parse_user_rate_limit(answer)
+
+
+async def test_user_rate_limit_501_is_the_normal_read_error() -> None:
+    async with InfoClient(BASE, http_client=client_for(Recorder(jr({}, 501)))) as info:
+        with pytest.raises(HttpError) as err:
+            await info.user_rate_limit(USER)
+    assert err.value.status == 501
+
+
+async def test_partly_accepted_action_has_quota_rejected_legs() -> None:
+    from riverbit_mm import is_quota_error
+
+    statuses = [
+        {"resting": {"oid": 1}},
+        {"error": f"action rejected by execution (code 1800) ({QUOTA_TEXT}) asset=3"},
+        {"error": QUOTA_TEXT},
+        {"error": "PrecisionExceeded"},
+    ]
+    reply = {"status": "ok", "response": {"data": {"statuses": statuses}}}
+    receipt = await exchange_for(Recorder(jr(reply))).place([ORDER] * 4)
+    assert [leg.quota_exhausted for leg in receipt.legs] == [False, True, True, False]
+    assert [leg.index for leg in receipt.quota_rejected] == [1, 2]
+    assert receipt.legs[1].error is not None and is_quota_error(receipt.legs[1].error)
+    assert not receipt.all_ok
+
+
+async def test_modify_quota_rejection_is_final_even_with_committed_result() -> None:
+    from riverbit_mm import QUOTA_EXHAUSTED_CODE
+
+    for extra in ({}, {"committedResult": {"data": {"statuses": [{"resting": {"oid": 9}}]}}}):
+        reply = {"status": "err", "response": QUOTA_TEXT, **extra}
+        with pytest.raises(ActionRejected) as err:
+            await exchange_for(Recorder(jr(reply))).modify(5, ORDER)
+        assert err.value.quota_exhausted and err.value.code == QUOTA_EXHAUSTED_CODE
+        assert QUOTA_TEXT in str(err.value)
+        assert not isinstance(err.value, UnknownOutcome)
+
+
+async def test_wrapped_quota_rejection_keeps_its_code() -> None:
+    reply = {
+        "status": "err",
+        "response": f"action rejected at ingress (code 1800) ({QUOTA_TEXT})",
+    }
+    with pytest.raises(ActionRejected) as err:
+        await exchange_for(Recorder(jr(reply))).place([ORDER])
+    assert err.value.code == 1800 and err.value.quota_exhausted
+
+
+async def test_other_rejections_are_not_quota_rejections() -> None:
+    reply = {"status": "err", "response": "action rejected by execution (code 91): unknown signer"}
+    with pytest.raises(ActionRejected) as err:
+        await exchange_for(Recorder(jr(reply))).place([ORDER])
+    assert not err.value.quota_exhausted and not err.value.reserve_overflow
+
+
+# ---------------------------------------------------------------- reserveRequestWeight
+
+
+async def test_purchase_success_receipt_has_no_legs() -> None:
+    reply = {"status": "ok", "response": {"type": "default"}}
+    rec = Recorder(jr(reply))
+    receipt = await exchange_for(rec).reserve_request_weight(1000)
+    assert receipt.acknowledged and receipt.legs == () and receipt.complete and receipt.all_ok
+    body = json.loads(rec.requests[0].content)
+    assert body["action"] == {"type": "reserveRequestWeight", "weight": 1000}
+    assert "vaultAddress" not in body
+
+
+async def test_purchase_for_a_vault_paid_by_the_master_uses_destination() -> None:
+    reply = {"status": "ok", "response": {"type": "default"}}
+    rec = Recorder(jr(reply))
+    await exchange_for(rec).reserve_request_weight(5, VAULT)
+    body = json.loads(rec.requests[0].content)
+    assert body["action"]["destination"] == VAULT and "vaultAddress" not in body
+
+
+async def test_purchase_with_a_vault_client_pays_from_the_vault() -> None:
+    reply = {"status": "ok", "response": {"type": "default"}}
+    rec = Recorder(jr(reply))
+    client = exchange_for(rec, vault=VAULT)
+    await client.reserve_request_weight(5)
+    await client.reserve_request_weight(5, VAULT)
+    assert all(json.loads(r.content)["vaultAddress"] == VAULT for r in rec.requests)
+    with pytest.raises(ValueError, match="destination"):
+        await client.reserve_request_weight(5, USER)
+    assert len(rec.requests) == 2  # nothing was signed or sent for the refused one
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        {"status": "err", "response": "insufficient balance"},
+        {
+            "status": "ok",
+            "response": {
+                "data": {
+                    "statuses": [
+                        {
+                            "error": "action rejected by execution (code 1801) "
+                            "(reserved request weight would overflow)"
+                        }
+                    ]
+                }
+            },
+        },
+    ],
+)
+async def test_purchase_rejections_are_final(reply: Any) -> None:
+    with pytest.raises(ActionRejected) as err:
+        await exchange_for(Recorder(jr(reply))).reserve_request_weight(5)
+    assert err.value.request is not None
+    if "statuses" in json.dumps(reply):
+        assert err.value.code == 1801 and err.value.reserve_overflow
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        {"status": "ok", "response": {"data": {"statuses": ["success"]}}},
+        {"status": "ok", "response": {"type": "other"}},
+        {"status": "ok"},
+        {"status": "err", "response": "action already pending"},
+        {"status": "err", "response": "duplicate nonce (code 205)"},
+    ],
+)
+async def test_odd_purchase_replies_are_unknown_outcomes(reply: Any) -> None:
+    with pytest.raises(UnknownOutcome):
+        await exchange_for(Recorder(jr(reply))).reserve_request_weight(5)
+
+
+async def test_purchase_timeout_and_5xx_are_unknown_and_never_retried() -> None:
+    for reply in (httpx.ReadTimeout("slow"), jr({}, 502)):
+        rec = Recorder(reply)
+        with pytest.raises(UnknownOutcome):
+            await exchange_for(rec).reserve_request_weight(5)
+        assert len(rec.requests) == 1
+
+
+# ---------------------------------------------------------------- gateway credential
+
+TOKEN = "tok-SECRET-123"
+HEADER = "X-RiverBit-MM-Token"
+
+
+async def test_gateway_token_is_sent_on_info_and_exchange_when_set() -> None:
+    rec = Recorder(jr({"nextAgentChainId": 1}))
+    async with ExchangeClient(
+        BASE, Signer("0x" + "01" * 32), http_client=client_for(rec), gateway_token=TOKEN
+    ) as client:
+        await client.load_chain_id()  # /info through the same core
+        rec.replies = [jr({"status": "ok", "response": {"type": "default"}})]
+        await client.reserve_request_weight(1)
+    assert [r.headers[HEADER] for r in rec.requests] == [TOKEN, TOKEN]
+    assert [r.url.path for r in rec.requests] == ["/info", "/exchange"]
+
+
+@pytest.mark.parametrize("token", [None, ""])
+async def test_gateway_token_is_not_sent_when_unset_or_empty(token: str | None) -> None:
+    rec = Recorder(jr({}))
+    async with InfoClient(BASE, http_client=client_for(rec), gateway_token=token) as info:
+        await info.query({"type": "chainIdentity"})
+    assert HEADER.lower() not in rec.requests[0].headers
+
+
+@pytest.mark.parametrize("bad", ["a\r\nb", "a\nb", "a\rb", "tok\u00e9", "a\x00b", "a\tb", "a\x7fb"])
+def test_gateway_token_with_header_unsafe_characters_is_refused(bad: str) -> None:
+    with pytest.raises(ValueError) as err:
+        InfoClient(BASE, gateway_token=bad)
+    assert bad not in str(err.value)
+    with pytest.raises(ValueError):
+        ExchangeClient(BASE, Signer("0x" + "01" * 32), gateway_token=bad)
+
+
+async def test_gateway_token_is_not_forwarded_across_redirects() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.host == "api.example.test":
+            return httpx.Response(307, headers={"Location": "https://other.example.test/info"})
+        return httpx.Response(200, json={})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True)
+    async with InfoClient(BASE, http_client=http, gateway_token=TOKEN) as info:
+        with pytest.raises(HttpError):
+            await info.query({"type": "chainIdentity"})
+    assert [r.url.host for r in seen] == ["api.example.test"]
+
+
+async def test_gateway_token_never_appears_in_repr_str_or_errors() -> None:
+    rec = Recorder(jr({"x": 1}, 500))
+    info = InfoClient(BASE, http_client=client_for(rec), gateway_token=TOKEN)
+    exchange = ExchangeClient(
+        BASE,
+        Signer("0x" + "01" * 32),
+        chain_id=1,
+        http_client=client_for(Recorder(jr({}, 502))),
+        gateway_token=TOKEN,
+    )
+    texts = [repr(info), str(info), repr(exchange), str(exchange), repr(info._core)]
+    with pytest.raises(HttpError) as http_err:
+        await info.query({"type": "chainIdentity"})
+    texts += [repr(http_err.value), str(http_err.value)]
+    with pytest.raises(UnknownOutcome) as unknown:
+        await exchange.reserve_request_weight(1)
+    texts += [repr(unknown.value), str(unknown.value), repr(unknown.value.request)]
+    for text in texts:
+        assert TOKEN not in text and "SECRET" not in text

@@ -1,6 +1,6 @@
 # riverbit-mm-sdk (Python)
 
-Python client library for market makers integrating with the RiverBit exchange API: signing, order entry, cancellation and modification over REST (`POST /exchange`), market data and order and fill events over the binary WebSocket (`bin-ws`), and reconciliation of requests whose outcome is unknown.
+Python client library for market makers integrating with the RiverBit exchange API: signing, order entry, cancellation and modification over REST (`POST /exchange`), request quota and request purchases, market data and order and fill events over the binary WebSocket (`bin-ws`), and reconciliation of requests whose outcome is unknown.
 
 > **Status: pre-release.** Interfaces may change before `v0.1.0`. The SDK contains no quoting strategy: it gives you the protocol, signing and reconciliation building blocks to run your own. Read the [protocol guide](../docs/api-guide.md) before you trade.
 
@@ -35,6 +35,8 @@ Nothing is tied to one environment. You pass the endpoints explicitly:
 | REST base URL | `https://pre-api.riverbit.io` | `InfoClient`, `ExchangeClient` (`/info`, `/exchange`) |
 | WebSocket URL | `wss://pre-api.riverbit.io/bin-ws` | `BinWsSession` |
 | Login host | `pre-api.riverbit.io` | `BinWsSession` (the `host:` line of the login message; must match the public server host name) |
+
+Optional: a **gateway credential** issued to you by RiverBit lifts the per-IP REST limits. Pass it as `gateway_token=` to `InfoClient` and `ExchangeClient` (the examples read it from `RIVERBIT_MM_TOKEN`). When set, every REST request to the configured base URL carries it in the `X-RiverBit-MM-Token` header and redirects are not followed; it is never sent over bin-ws, never logged and never shown in `repr` or error messages. An empty value means "not set"; a value with a character that is invalid in an HTTP header (CR, LF, control or non-ASCII characters) is refused at construction. It does not change signing or nonces. The server treats an invalid credential as no credential.
 
 An **API wallet** signs; the **master account** (or a vault it leads) is the trading account. The master must authorize the API wallet first. Keep private keys out of source control, command lines and logs; `Signer` never prints its key.
 
@@ -109,6 +111,7 @@ More in [`examples/`](examples/):
 | [`stream_market_data.py`](examples/stream_market_data.py) | Log in, stream the `l2` book and print the best bid and ask; resync on gaps |
 | [`place_query_cancel.py`](examples/place_query_cancel.py) | Place a post-only order with a cloid, query it, cancel it; unknown-outcome handling |
 | [`batch_modify.py`](examples/batch_modify.py) | Move two orders with one `batchModify`, read the new oids from the receipt |
+| [`quota.py`](examples/quota.py) | Print the `userRateLimit` and the remaining requests; with `BUY_REQUESTS=<n>` also buy `n` requests (signs and sends; without it nothing is signed) |
 | [`reconcile_after_reconnect.py`](examples/reconcile_after_reconnect.py) | Rebuild order state after a bin-ws reconnect and reconcile pending requests |
 
 The examples read the key from the file named by `RIVERBIT_KEY_FILE` and the endpoints from `RIVERBIT_*` environment variables (PRE defaults); see [`examples/_common.py`](examples/_common.py). The trading examples send real orders: use a test account.
@@ -119,9 +122,11 @@ The examples read the key from the file named by `RIVERBIT_KEY_FILE` and the end
 |---|---|---|
 | Signing of trading actions (MessagePack in key order, `connectionId`, EIP-712, with and without a vault) | Yes | Reproduces every vector in `testdata/vectors.json` byte for byte |
 | bin-ws login signing (EIP-191) | Yes | |
-| Actions: `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`, `Cloid` | Yes | Fixed field order; prices and sizes must be decimal strings |
-| REST `/info` client | Yes | `chainIdentity`, `userRole`, `leadingVaults`, `metaAndAssetCtxs`, `l2Book`, `openOrders`, `frontendOpenOrders`, `orderStatus`, `userFills`, `clearinghouseState`, `candleSnapshot`, plus `query()` for any other type; `Retry-After` honoured on 429 |
+| Actions: `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`, `reserveRequestWeight`, `Cloid` | Yes | Fixed field order; prices and sizes must be decimal strings |
+| REST `/info` client | Yes | `chainIdentity`, `userRole`, `leadingVaults`, `metaAndAssetCtxs`, `l2Book`, `openOrders`, `frontendOpenOrders`, `orderStatus`, `userFills`, `clearinghouseState`, `candleSnapshot`, typed `userRateLimit`, plus `query()` for any other type; `Retry-After` honoured on 429 |
 | REST `/exchange` client | Yes | Per-leg receipts; rejection, rate limit and unknown outcome are distinct |
+| Request quota: `userRateLimit` query, `remaining` helper, quota rejections told apart, request purchase | Yes | A quota rejection is final; the SDK never retries or buys on its own |
+| Optional gateway credential on REST clients | Yes | `X-RiverBit-MM-Token`; never sent over bin-ws |
 | bin-ws session | Yes | Login as the first frame, subscribe/unsubscribe, ping, id-matched `info_json` queries, reconnect with login and resubscribe |
 | Typed frames | Yes | `l2` (snapshot and update), `l2Book`, `bbo`, `trades`, `candle`; every other stream, and the JSON fallback of typed streams, as `JsonFrame` |
 | Local order book | Yes | Replays `l2` snapshots and updates (typed and JSON fallback) per guide section 5 |
@@ -141,7 +146,9 @@ Everything below is importable from `riverbit_mm`.
 - `Signer(private_key)`: `address`, `address_lower`, `sign_action(action_json, nonce, chain_id=..., vault_address=None) -> SignedRequest`, `sign_login(host, timestamp_ms, nonce=None)`.
 - `SignedRequest`: `body` (the exact bytes to `POST` to `/exchange`), `action_json`, `nonce`, `signature`, `vault_address`, `connection_id`, `digest`. The request body is assembled around the very bytes the signature was computed from; nothing is serialised twice.
 
-**Actions** (`riverbit_mm.actions`): `Order`, `Place` (the `order` action), `Cancel` / `CancelItem`, `CancelByCloid` / `CancelByCloidItem`, `Modify`, `BatchModify` / `ModifyItem`, `Cloid`. Each action has `to_json() -> bytes`. `Place` is the `order` action and `Order` is one order leg; `CancelItem`, `CancelByCloidItem` and `ModifyItem` are the legs of `cancel`, `cancelByCloid` and `batchModify`. Wrap legs in the action: `Place` takes `Order`s, `Cancel` takes `CancelItem`s, `CancelByCloid` takes `CancelByCloidItem`s, `BatchModify` takes `ModifyItem`s; `Modify` takes one oid and one `Order`.
+**Actions** (`riverbit_mm.actions`): `Order`, `Place` (the `order` action), `Cancel` / `CancelItem`, `CancelByCloid` / `CancelByCloidItem`, `Modify`, `BatchModify` / `ModifyItem`, `ReserveRequestWeight`, `Cloid`. Each action has `to_json() -> bytes`. `Place` is the `order` action and `Order` is one order leg; `CancelItem`, `CancelByCloidItem` and `ModifyItem` are the legs of `cancel`, `cancelByCloid` and `batchModify`. Wrap legs in the action: `Place` takes `Order`s, `Cancel` takes `CancelItem`s, `CancelByCloid` takes `CancelByCloidItem`s, `BatchModify` takes `ModifyItem`s; `Modify` takes one oid and one `Order`.
+
+`ReserveRequestWeight(weight, destination=None)` buys `weight` requests (`1 <= weight <= 1_000_000_000`, checked before signing) for 0.0005 USDC each (`reserve_cost_micro_usdc(weight)` is `weight * 500` micro-USDC). `destination` is the account that receives them; absent means the payer. Without a vault the payer is the signer's account (an API wallet pays from its master); to have the master pay for a vault, use a client **without** `vault_address` and set `destination` to the vault. With `vault_address` the vault pays and receives, so `destination` must be absent or equal to the vault (the client refuses anything else before signing); vault-paid purchases may be disabled on a network. A purchase does not consume quota itself.
 
 ```python
 Place([Order(asset=1, is_buy=True, price="80000", size="0.001", tif="Alo", cloid=Cloid.random())])
@@ -149,10 +156,16 @@ Place([Order(asset=1, is_buy=True, price="80000", size="0.001", tif="Alo", cloid
 
 **Clients**
 
-- `InfoClient(base_url)`: one coroutine per query type, `assets()` (parsed `universe`), `next_agent_chain_id()`, and `query(body)` for anything else.
-- `ExchangeClient(base_url, signer, chain_id=None, vault_address=None)`: `post(action)` (sign with a fresh nonce and send once), `prepare(action)` / `sign(action)` (sign only, so you can persist the request first), `submit(signed_request)`, and shortcuts `place`, `cancel`, `cancel_by_cloid`, `modify`, `batch_modify`. Actions go out with `POST /exchange`.
+- `InfoClient(base_url, gateway_token=None)`: one coroutine per query type, `user_rate_limit(user)` (typed `UserRateLimit`, see below), `assets()` (parsed `universe`), `next_agent_chain_id()`, and `query(body)` for anything else.
+- `ExchangeClient(base_url, signer, chain_id=None, vault_address=None, gateway_token=None)`: `post(action)` (sign with a fresh nonce and send once), `prepare(action)` / `sign(action)` (sign only, so you can persist the request first), `submit(signed_request)`, and shortcuts `place`, `cancel`, `cancel_by_cloid`, `modify`, `batch_modify`, `reserve_request_weight`. Actions go out with `POST /exchange`.
 - `BinWsSession(url, login_host, signer)`: `start()` / `close()` (or `async with`), `subscribe` / `unsubscribe` (recorded and re-sent after a reconnect), `ping`, `post_info`, `query` (unwraps `data`, retries a 429 reply), `frames()` (async iterator), `user`, `signer_address`.
 - `riverbit_mm.subscriptions`: builders for `l2`, `l2_book`, `bbo`, `trades`, `candle`, `order_updates`, `user_fills`, `open_orders`, `clearinghouse_state`.
+
+**Request quota**
+
+Each account (the master account, or the vault when trading for a vault; API wallets count against the account they act for) has a cumulative request cap of `10000` plus one request per USD traded. An `order` leg, a `modify`, a `batchModify` entry and a `cancel` / `cancelByCloid` entry cost one request each. Cancels have a higher cap, `min(cap + 100000, 2 * cap)`. Over the cap, one request is still accepted every 10 seconds. Purchased requests raise both caps.
+
+`await info.user_rate_limit(account)` (`account` is the master or a vault, not an API wallet) returns a `UserRateLimit`: `cum_vlm` (decimal string), `requests_cap` (ordinary actions, purchased requests not included), `requests_used` (`max(0, used - purchased)`), `requests_surplus` (`max(0, purchased - used)`; at most one of the two is above zero) and `remaining` (`max(0, cap - used) + surplus`). A node that cannot answer replies HTTP 501, raised as `HttpError`. `parse_user_rate_limit` parses the raw answer; counts may be JSON numbers or decimal strings.
 
 **Frames and book**
 
@@ -166,9 +179,19 @@ Place([Order(asset=1, is_buy=True, price="80000", size="0.001", tif="Alo", cloid
 
 | Exception | Meaning | What to do |
 |---|---|---|
-| `ActionRejected` | The node rejected the whole action (`.code`, for example 91, 1160, 203, 204, 97). Nothing executed. | Fix the cause, then build a **new** action. The nonce is spent. |
+| `ActionRejected` | The node rejected the whole action (`.code`, for example 91, 1160, 203, 204, 97, 1800 for the request quota, 1801 for a purchase overflow). Nothing executed. | Fix the cause, then build a **new** action. The nonce is spent. |
 | `RateLimited` | A read was throttled and the retries ran out (`.retry_after`). | Back off. Read clients already retry after `Retry-After`. |
 | `UnknownOutcome` | A write may or may not have executed: timeout, disconnect, non-200 (including 429 and 5xx), malformed or incomplete reply (statuses that do not match the legs sent, a leg without its oid), a duplicate nonce (code 205: the first request with that nonce may have executed), or a reply that asks you to query first (`action already pending`, `localCommitted`, ...). Carries `.nonce`, `.request` and `.request_body`. | **Never re-sign it under a new nonce.** Reconcile with `reconcile_unknown` / `wait_reconciled`, and hold conflicting writes until it resolves. |
+
+**Quota rejections** carry the text `Too many cumulative requests sent` (possibly wrapped as `action rejected by execution (code 1800) (...)`, and a cancel leg appends ` asset=N`). They are final, never an unknown outcome:
+
+- per leg (`order`, `batchModify`, `cancel`, `cancelByCloid`): the leg is `kind == "error"` and `leg.quota_exhausted` is true; `receipt.quota_rejected` lists them. An action can be partly accepted: the first legs execute and every later leg carries the quota error;
+- whole action (`modify`): `ActionRejected` with `exc.quota_exhausted` true and `exc.code == QUOTA_EXHAUSTED_CODE` (1800), also when the reply carries a `committedResult`;
+- `is_quota_error(text)` matches the text by substring; `QUOTA_EXHAUSTED_CODE` is 1800 and `RESERVE_OVERFLOW_CODE` (1801: a purchase would overflow the purchased total, `exc.reserve_overflow`).
+
+Back off (one request per 10 seconds is still accepted), trade, or buy requests. The SDK never retries and never buys on its own.
+
+**A purchase** (`reserveRequestWeight`) has no legs: `ok` with `{"type":"default"}` is a `Receipt` with `acknowledged` true and no `legs`; an `err` reply or any `error` entry is an `ActionRejected`; anything else (timeout, 5xx, malformed) is an `UnknownOutcome`, never re-sent. It has no oid or cloid, so it cannot be looked up: `reconcile_unknown` returns a `Reconciliation` with `resolved` false and `lookup_supported` false (and `wait_reconciled` returns at once). Compare `userRateLimit` (`requests_surplus` and `requests_used`) before and after, and do not buy again until you know.
 
 A 429 on a write is deliberately reported as `UnknownOutcome`, not `RateLimited`: an HTTP status alone does not prove non-execution, and the SDK never retries a write.
 

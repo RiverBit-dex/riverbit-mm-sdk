@@ -5,7 +5,7 @@
 //! orders up by oid or cloid and report exactly what was found, so that the
 //! caller can decide with evidence.
 
-use crate::actions::OrderRef;
+use crate::actions::{ActionKind, OrderRef};
 use crate::error::{Error, Result, UnknownOutcome};
 use crate::info::{InfoClient, OrderState, OrderStatusReply};
 use crate::signing::Address;
@@ -38,6 +38,8 @@ impl OrderReport {
 }
 
 /// Looks up each target with `orderStatus` for the master account or vault `user`.
+///
+/// An empty `targets` returns an empty list without querying.
 pub async fn reconcile_orders(
     info: &InfoClient,
     user: &Address,
@@ -61,11 +63,22 @@ pub async fn reconcile_orders(
 /// carried one, otherwise the master account. Orders that were never given a
 /// cloid cannot be found this way; use `frontend_open_orders` and `user_fills`
 /// for those.
+///
+/// A `reserveRequestWeight` purchase has no order, so it cannot be reconciled
+/// here: this returns [`Error::InvalidInput`]. Compare
+/// [`InfoClient::user_rate_limit`] (`nRequestsSurplus` and `nRequestsUsed`)
+/// from before the purchase with a fresh read, and never sign the purchase
+/// again with a new nonce.
 pub async fn reconcile(
     info: &InfoClient,
     user: &Address,
     outcome: &UnknownOutcome,
 ) -> Result<Vec<OrderReport>> {
+    if outcome.request.kind() == ActionKind::ReserveRequestWeight {
+        return Err(Error::InvalidInput(
+            "a request-quota purchase has no order to look up; compare userRateLimit (surplus and used) from before the purchase with a fresh read, and do not sign the purchase again".into(),
+        ));
+    }
     let targets = outcome.request.targets();
     if targets.is_empty() {
         return Err(Error::InvalidInput(

@@ -9,11 +9,12 @@
 //! | `RIVERBIT_WS_URL` | bin-ws URL | `wss://pre-api.riverbit.io/bin-ws` |
 //! | `RIVERBIT_LOGIN_HOST` | host line of the login message | `pre-api.riverbit.io` |
 //! | `RIVERBIT_COIN` | market | `BTC` |
+//! | `RIVERBIT_MM_TOKEN` | optional gateway credential; sent as `X-RiverBit-MM-Token` on REST requests only | unset |
 
 #![allow(dead_code)]
 
 use riverbit_mm_sdk::info::UserRole;
-use riverbit_mm_sdk::{Address, BinWsConfig, InfoClient, Signer, SigningDomain};
+use riverbit_mm_sdk::{Address, BinWsConfig, ExchangeClient, InfoClient, Signer, SigningDomain};
 
 pub struct Env {
     pub base_url: String,
@@ -21,6 +22,8 @@ pub struct Env {
     pub login_host: String,
     pub coin: String,
     pub signer: Signer,
+    /// The optional gateway credential (never printed).
+    pub token: Option<String>,
 }
 
 fn var(name: &str, default: &str) -> String {
@@ -46,6 +49,10 @@ impl Env {
             ws_url: var("RIVERBIT_WS_URL", "wss://pre-api.riverbit.io/bin-ws"),
             login_host: var("RIVERBIT_LOGIN_HOST", "pre-api.riverbit.io"),
             coin: var("RIVERBIT_COIN", "BTC"),
+            token: std::env::var("RIVERBIT_MM_TOKEN")
+                .ok()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty()),
             signer: Signer::from_hex(&key)
                 .expect("the key file must hold the private key as 32 bytes of hex"),
         }
@@ -60,7 +67,24 @@ impl Env {
     }
 
     pub fn info(&self) -> InfoClient {
-        InfoClient::new(&self.base_url).expect("build the info client")
+        let info = InfoClient::new(&self.base_url).expect("build the info client");
+        match &self.token {
+            Some(token) => info
+                .with_gateway_token(token)
+                .expect("RIVERBIT_MM_TOKEN is not a valid header value"),
+            None => info,
+        }
+    }
+
+    pub fn exchange(&self, domain: SigningDomain) -> ExchangeClient {
+        let exchange = ExchangeClient::new(&self.base_url, self.signer.clone(), domain)
+            .expect("build the exchange client");
+        match &self.token {
+            Some(token) => exchange
+                .with_gateway_token(token)
+                .expect("RIVERBIT_MM_TOKEN is not a valid header value"),
+            None => exchange,
+        }
     }
 
     /// The account the signer trades for: the master behind an API wallet, or

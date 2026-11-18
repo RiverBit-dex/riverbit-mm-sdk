@@ -80,6 +80,8 @@ type Client struct {
 	vaultOperator bool
 	submitMu      sync.Mutex
 	nonce         uint64
+	// token is the optional gateway credential; see SetGatewayCredential.
+	token *gatewayToken
 }
 
 // New returns a Client that signs with signer and trades for signer's own
@@ -278,7 +280,7 @@ func (c *Client) connectionID(action any, nonce uint64) ([]byte, error) {
 
 // errUnsupportedAction is returned for anything but the SDK's ordered action
 // types: signing and sending must serialize the very same ordered value.
-var errUnsupportedAction = errors.New("unsupported action: sign only the SDK action types (*Place, *Cancel, *CancelByCloid, *Modify, *BatchModify, or their values), or the result of ParseAction")
+var errUnsupportedAction = errors.New("unsupported action: sign only the SDK action types (*Place, *Cancel, *CancelByCloid, *Modify, *BatchModify, *ReserveRequestWeight, or their values), or the result of ParseAction")
 
 // checkSignable accepts the action types whose struct field order defines both
 // the MessagePack image that is signed and the JSON body that is sent. Maps,
@@ -289,6 +291,12 @@ func checkSignable(action any) error {
 	switch a := action.(type) {
 	case Place, Cancel, CancelByCloid, Modify, BatchModify:
 		return nil
+	case ReserveRequestWeight:
+		return a.Validate()
+	case *ReserveRequestWeight:
+		if a != nil {
+			return a.Validate()
+		}
 	case *Place:
 		if a != nil {
 			return nil
@@ -317,6 +325,11 @@ func (c *Client) signingDigest(action any, nonce uint64) ([]byte, error) {
 	if err := checkSignable(action); err != nil {
 		return nil, err
 	}
+	if a, ok := reserveAction(action); ok {
+		if err := c.checkReserve(a); err != nil {
+			return nil, err
+		}
+	}
 	if c.SignChainID == 0 {
 		return nil, ErrNoChainID
 	}
@@ -334,8 +347,8 @@ func (c *Client) signingDigest(action any, nonce uint64) ([]byte, error) {
 // SignedRequest to get the complete body.
 //
 // action must be one of the SDK's ordered action types (*Place, *Cancel,
-// *CancelByCloid, *Modify, *BatchModify or their values), for example the
-// result of ParseAction. Anything else, including a map or json.RawMessage,
+// *CancelByCloid, *Modify, *BatchModify, *ReserveRequestWeight or their
+// values), for example the result of ParseAction. Anything else, including a map or json.RawMessage,
 // is refused, because its JSON and MessagePack encodings could differ.
 func (c *Client) Sign(action any, nonce uint64) (Signature, error) {
 	digest, err := c.signingDigest(action, nonce)
@@ -379,7 +392,10 @@ func (c *Client) LoadChainID(ctx context.Context) error {
 
 // InfoClient returns a REST /info client that shares the Client's URL and HTTP
 // client.
-func (c *Client) InfoClient() *InfoClient { return &InfoClient{URL: c.URL, HTTP: c.HTTP} }
+// The gateway credential, if set, is shared too.
+func (c *Client) InfoClient() *InfoClient {
+	return &InfoClient{URL: c.URL, HTTP: c.HTTP, token: c.token}
+}
 
 // Info queries POST <URL>/info and decodes the answer into out. It always uses
 // REST; see InfoClient.
@@ -435,8 +451,8 @@ func (c *Client) OpenOrders(ctx context.Context) ([]OpenOrder, error) {
 }
 
 // Exchange signs action with a fresh nonce, submits it and reconciles it.
-// action is a *Place, *Cancel, *CancelByCloid, *Modify or *BatchModify (the
-// value forms work too).
+// action is a *Place, *Cancel, *CancelByCloid, *Modify, *BatchModify or
+// *ReserveRequestWeight (the value forms work too).
 //
 // It returns nil only when the action is known to have executed on every leg.
 // A rejection in which no leg ran is an *ActionRejectedError, or wraps
@@ -564,6 +580,10 @@ func (c *Client) submit(ctx context.Context, action any, n uint64, s Signature) 
 		return c.unknown(action, n, fmt.Errorf("invalid exchange response: %w", err))
 	}
 	c.LastReceipt, _ = ParseReceipt(reply)
+	if _, ok := reserveAction(action); ok {
+		// A purchase has no legs and no order to look up.
+		return c.judgeReserve(action, n, result.Status, result.Response, result.CommittedResult)
+	}
 	// Preserve complete per-leg results before an individual error discards
 	// them. A rejected leg has no cloid to discover via /info.
 	if c.StateDir != "" {

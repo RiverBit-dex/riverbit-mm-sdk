@@ -73,7 +73,7 @@ async def run(
     recovering = False
     events = 0
     async with (
-        InfoClient(cfg.base_url, http_client=http_client) as info,
+        InfoClient(cfg.base_url, http_client=http_client, gateway_token=cfg.gateway_token) as info,
         BinWsSession(cfg.ws_url, cfg.login_host, cfg.signer) as session,
     ):
         account = cfg.vault or session.user

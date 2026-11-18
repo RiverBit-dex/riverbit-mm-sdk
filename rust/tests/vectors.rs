@@ -6,7 +6,7 @@ use riverbit_mm_sdk::signing::{
 };
 use riverbit_mm_sdk::{
     Action, BatchModify, Cancel, CancelByCloid, CancelByCloidItem, CancelItem, Cloid, Modify,
-    ModifyItem, NonceSource, Order, Place, Tif,
+    ModifyItem, NonceSource, Order, Place, ReserveRequestWeight, Tif,
 };
 use serde_json::Value;
 
@@ -209,6 +209,13 @@ fn typed(action_json: &str) -> Box<dyn Action> {
                 })
                 .collect(),
         )),
+        "reserveRequestWeight" => {
+            let mut action = ReserveRequestWeight::new(v["weight"].as_u64().unwrap());
+            if let Some(d) = v.get("destination") {
+                action = action.with_destination(d.as_str().unwrap().parse().unwrap());
+            }
+            Box::new(action)
+        }
         other => panic!("unknown action type {other}"),
     }
 }
@@ -260,6 +267,24 @@ fn typed_actions_serialize_to_the_vector_bytes_and_sign_to_the_vector_signature(
             request.kind().as_str(),
             body["action"]["type"].as_str().unwrap()
         );
+    }
+}
+
+#[test]
+fn every_vector_action_type_is_covered_by_a_typed_action() {
+    let v = vectors();
+    let names: Vec<&str> = v["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    for name in [
+        "reserve-request-weight-no-vault",
+        "reserve-request-weight-destination",
+        "reserve-request-weight-vault",
+    ] {
+        assert!(names.contains(&name), "{name} missing from vectors.json");
     }
 }
 
