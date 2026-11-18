@@ -8,9 +8,16 @@
 //!
 //! Requests that were in flight when a connection ended fail. For a signed
 //! action that is an unknown outcome: reconcile, never re-sign.
+//!
+//! **Order entry is not available on the public endpoint.** The public
+//! `/bin-ws` endpoint does not accept `action_json`: the server replies
+//! `504 Gateway Timeout`. Send orders, cancellations and modifications over
+//! REST `POST /exchange` (see [`ExchangeClient`](crate::ExchangeClient)). Use
+//! bin-ws for market data, order and fill events and `info_json` queries. The
+//! `action_json` transport below is kept for endpoints that accept it.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -71,7 +78,8 @@ pub struct BinWsConfig {
     pub login_timeout: Duration,
     /// Treat the connection as dead if nothing arrives for this long. Default 60 s.
     pub idle_timeout: Duration,
-    /// Bound on waiting for the reply to a posted request. Default 20 s.
+    /// Bound on waiting for the reply to a posted request. A request that is
+    /// still queued when it runs out is dropped unwritten. Default 20 s.
     pub request_timeout: Duration,
     /// Reconnect behavior. `None` ends the session when the connection drops.
     pub reconnect: Option<ReconnectPolicy>,
@@ -138,10 +146,63 @@ impl Events {
     }
 }
 
+/// Where a posted request is: not yet written, written, or given up on by its
+/// caller. Whoever moves it out of `QUEUED` first decides: the session task
+/// writes the frame only if it wins, the caller may report "never sent" only
+/// if it wins.
+struct PostState(AtomicU8);
+
+impl PostState {
+    const QUEUED: u8 = 0;
+    const WRITTEN: u8 = 1;
+    const CANCELLED: u8 = 2;
+
+    fn new() -> Arc<Self> {
+        Arc::new(PostState(AtomicU8::new(Self::QUEUED)))
+    }
+
+    /// The session task is about to write the frame. False if the caller has
+    /// already given up, in which case the frame must not be written.
+    fn claim_for_write(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::QUEUED,
+                Self::WRITTEN,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// The caller gives up. True if the frame had not been claimed for writing:
+    /// it will never be written.
+    fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::QUEUED,
+                Self::CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+}
+
+/// Cancels a queued post when the caller's future is dropped (for example by
+/// an outer timeout), so a request nobody waits for is never written later.
+struct CancelOnDrop(Arc<PostState>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 enum Cmd {
     Post {
         id: u64,
         frame: Vec<u8>,
+        state: Arc<PostState>,
         reply: oneshot::Sender<std::result::Result<ServerFrame, TransportError>>,
     },
     Subscribe {
@@ -280,16 +341,30 @@ impl BinWsSession {
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst) + 1;
         let frame = ClientFrame { id, body: body() }.encode();
         let (tx, rx) = oneshot::channel();
+        let state = PostState::new();
+        // Declared before the send so that every way out of this function,
+        // including the future being dropped while it waits for queue space,
+        // marks the post as given up.
+        let _guard = CancelOnDrop(state.clone());
         self.inner
             .cmd
             .send(Cmd::Post {
                 id,
                 frame,
+                state: state.clone(),
                 reply: tx,
             })
             .await
-            .map_err(|_| TransportError::Disconnected("session task ended".into()))?;
+            .map_err(|_| TransportError::NotSent("session task ended".into()))?;
         let reply = match timeout(self.inner.request_timeout, rx).await {
+            // Still queued: the session task will see the cancellation and
+            // drop the frame, so nothing was or will be written. Otherwise the
+            // frame was written (or is being written) and no reply came.
+            Err(_) if state.cancel() => {
+                return Err(TransportError::NotSent(
+                    "timed out before the request was written".into(),
+                ))
+            }
             Err(_) => return Err(TransportError::Timeout),
             Ok(Err(_)) => return Err(TransportError::Disconnected("session task ended".into())),
             Ok(Ok(result)) => result?,
@@ -301,6 +376,16 @@ impl BinWsSession {
 impl ActionTransport for BinWsSession {
     /// Sends `body` as `action_json`, byte for byte, and returns the
     /// exchange's answer from the `post` reply with the same id.
+    ///
+    /// **The public `/bin-ws` endpoint does not accept `action_json`** (the
+    /// server replies `504 Gateway Timeout`, which is an unknown outcome for
+    /// a signed action). Send orders over REST. This transport is for
+    /// endpoints that accept the frame.
+    ///
+    /// If `request_timeout` runs out while the request is still queued, it is
+    /// dropped without ever being written and the error is
+    /// [`TransportError::NotSent`]; once it has been written, running out of
+    /// time is [`TransportError::Timeout`], an unknown outcome.
     fn post_action<'a>(
         &'a self,
         body: &'a [u8],
@@ -640,7 +725,18 @@ impl Task {
     async fn on_cmd(&mut self, ws: &mut Ws, cmd: Cmd) -> std::result::Result<bool, String> {
         match cmd {
             Cmd::Close => return Ok(false),
-            Cmd::Post { id, frame, reply } => {
+            Cmd::Post {
+                id,
+                frame,
+                state,
+                reply,
+            } => {
+                // The caller may have timed out while this was queued behind
+                // a full event queue. Writing it now would send an order the
+                // caller was told never went out.
+                if !state.claim_for_write() {
+                    return Ok(true);
+                }
                 if self.pending.len() > 64 {
                     self.pending.retain(|_, r| !r.is_closed());
                 }

@@ -129,20 +129,50 @@ async def test_missing_cloid_cannot_be_resolved() -> None:
 async def test_cancel_needs_a_current_inactive_order() -> None:
     request = signed(Cancel([CancelItem(0, 5), CancelItem(0, 6)]))
     done = FakeInfo({5: order_reply(5, "canceled"), 6: order_reply(6, "filled")})
-    assert (await reconcile_unknown(done, USER, request)).resolved
+    result = await reconcile_unknown(done, USER, request)
+    assert result.targets_settled  # the targets are terminal ...
+    assert not result.request_final and not result.resolved  # ... the request is not settled
+    assert "cancel request itself is unconfirmed" in result.unresolved[-1]
     open_still = FakeInfo({5: order_reply(5, "canceled"), 6: order_reply(6, "open")})
     result = await reconcile_unknown(open_still, USER, request)
-    assert not result.resolved and "oid=6" in result.unresolved[0]
+    assert not result.targets_settled and "oid=6" in result.unresolved[0]
     # a leg result alone cannot show the order is no longer live
     legs_only = FakeInfo({5: leg_reply("resting", 5), 6: order_reply(6, "canceled")})
-    assert not (await reconcile_unknown(legs_only, USER, request)).resolved
+    result = await reconcile_unknown(legs_only, USER, request)
+    assert not result.targets_settled and not result.resolved
 
 
-async def test_cancel_by_cloid() -> None:
+async def test_cancel_by_cloid_is_never_resolved_by_its_target() -> None:
     request = signed(CancelByCloid([CancelByCloidItem(0, C1)]))
     info = FakeInfo({str(C1): order_reply(7, "canceled")})
-    assert (await reconcile_unknown(info, USER, request)).resolved
+    result = await reconcile_unknown(info, USER, request)
     assert info.queries[0]["oid"] == str(C1)
+    assert result.targets_settled and not result.request_final and not result.resolved
+    assert result.hold_cloids == (str(C1),)  # must not be reused while the request is pending
+    # the same answer even though the order is terminal and a new order could reuse the cloid
+    again = await reconcile_unknown(FakeInfo({str(C1): order_reply(8, "filled")}), USER, request)
+    assert not again.resolved
+
+
+async def test_resolved_placements_hold_no_cloids() -> None:
+    request = signed(Place([Order(0, True, "1", "1", cloid=C1)]))
+    result = await reconcile_unknown(FakeInfo({str(C1): order_reply(11, "open")}), USER, request)
+    assert result.resolved and result.targets_settled and result.request_final
+    assert result.hold_cloids == ()
+    pending = await reconcile_unknown(FakeInfo({}), USER, request)
+    assert not pending.resolved and pending.hold_cloids == (str(C1),)
+
+
+async def test_wait_reconciled_returns_for_a_cancel_without_resolving() -> None:
+    request = signed(CancelByCloid([CancelByCloidItem(0, C1)]))
+    info = FakeInfo({str(C1): order_reply(7, "canceled")})
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    result = await wait_reconciled(info, USER, request, timeout=60, sleep=fake_sleep)
+    assert result.targets_settled and not result.resolved and sleeps == []
 
 
 async def test_batch_modify_waits_for_the_replacement() -> None:

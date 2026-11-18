@@ -1,22 +1,22 @@
-//! Trades over one bin-ws session and reconciles after a reconnect.
+//! Sends an order over REST, follows order events over bin-ws and reconciles
+//! unknown outcomes by cloid.
 //!
 //! ```text
-//! RIVERBIT_PRIVATE_KEY=0x... RIVERBIT_PRICE=50000 RIVERBIT_SIZE=0.001 \
+//! RIVERBIT_KEY_FILE=./key RIVERBIT_PRICE=50000 RIVERBIT_SIZE=0.001 \
 //!   cargo run --example reconcile_after_reconnect
 //! ```
 //!
-//! The action is sent as `action_json` on the logged-in connection. If the
-//! connection drops before the reply arrives the outcome is unknown: the
-//! example keeps the request, waits for the session to log in and resubscribe,
-//! then looks the order up by its cloid. It never signs the order again.
+//! Orders go out as `POST /exchange`: the public bin-ws endpoint does not
+//! accept `action_json`. The bin-ws session carries the `orderUpdates` stream.
+//! If the order's outcome is unknown (timeout, HTTP error, ambiguous reply) the
+//! example keeps the signed request, looks the order up by its cloid, and looks
+//! again each time the session reconnects. It never signs the order again.
 
 mod common;
 
-use std::sync::Arc;
-
 use riverbit_mm_sdk::{
-    reconcile, BinWsSession, Cloid, Error, Event, ExchangeClient, InfoClient, Order, OrderReport,
-    Place, Subscription, Tif, UnknownOutcome,
+    reconcile, Address, BinWsSession, Cloid, Error, Event, ExchangeClient, InfoClient, Order,
+    OrderReport, Place, Subscription, Tif, UnknownOutcome,
 };
 
 #[tokio::main]
@@ -42,8 +42,8 @@ async fn main() {
         .subscribe(&Subscription::order_updates(&master))
         .await
         .expect("subscribe");
-    let exchange =
-        ExchangeClient::with_transport(Arc::new(session.clone()), env.signer.clone(), domain);
+    let exchange = ExchangeClient::new(&env.base_url, env.signer.clone(), domain)
+        .expect("build the exchange client");
 
     let order =
         Order::limit(asset, true, price, size, Tif::Alo).with_cloid(Cloid::random().unwrap());
@@ -61,7 +61,9 @@ async fn main() {
         Err(e) => eprintln!("{e}"),
     }
 
-    // Reconcile whatever is pending each time the session comes back.
+    // Look the pending request up now, and again after every reconnect.
+    pending = settle(&info, &master, pending).await;
+
     while let Some(event) = events.next().await {
         match event {
             Event::Frame(frame) => println!("{frame:?}"),
@@ -74,26 +76,7 @@ async fn main() {
                     .await
                     .expect("frontendOpenOrders");
                 println!("{} open order(s) after reconnect", open.len());
-                let mut still_unknown = Vec::new();
-                for unknown in pending.drain(..) {
-                    let reports: Vec<OrderReport> = reconcile(&info, &master, &unknown)
-                        .await
-                        .expect("reconcile");
-                    for report in &reports {
-                        println!(
-                            "nonce {}: {:?} -> {:?}",
-                            unknown.nonce(),
-                            report.target,
-                            report.reply.state
-                        );
-                    }
-                    // `unknownOid` is not proof that nothing executed: only a
-                    // found order (or enough other evidence) settles a request.
-                    if reports.iter().all(|r| r.is_unknown_oid()) {
-                        still_unknown.push(unknown);
-                    }
-                }
-                pending = still_unknown;
+                pending = settle(&info, &master, std::mem::take(&mut pending)).await;
                 if pending.is_empty() {
                     break;
                 }
@@ -105,4 +88,30 @@ async fn main() {
         }
     }
     session.close().await;
+}
+
+/// Reconciles each pending request; returns those that are still unsettled.
+async fn settle(
+    info: &InfoClient,
+    master: &Address,
+    pending: Vec<UnknownOutcome>,
+) -> Vec<UnknownOutcome> {
+    let mut still_unknown = Vec::new();
+    for unknown in pending {
+        let reports: Vec<OrderReport> = reconcile(info, master, &unknown).await.expect("reconcile");
+        for report in &reports {
+            println!(
+                "nonce {}: {:?} -> {:?}",
+                unknown.nonce(),
+                report.target,
+                report.reply.state
+            );
+        }
+        // `unknownOid` is not proof that nothing executed: only a found order
+        // (or enough other evidence) settles a request.
+        if reports.iter().all(|r| r.is_unknown_oid()) {
+            still_unknown.push(unknown);
+        }
+    }
+    still_unknown
 }

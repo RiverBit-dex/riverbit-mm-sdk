@@ -25,6 +25,8 @@ type fakeREST struct {
 	mu        sync.Mutex
 	exchanges [][]byte // raw /exchange bodies, in order
 	cloids    []string // orderStatus oids that were cloids
+	oids      []uint64 // orderStatus oids that were order IDs
+	book      cloidBook
 	// exchange answers one /exchange body; it may block or fail.
 	exchange func(w http.ResponseWriter, r *http.Request, body []byte)
 	// pendingLookups makes the first N orderStatus answers unknownOid.
@@ -40,6 +42,7 @@ func newFakeREST(t *testing.T, account string) *fakeREST {
 			f.mu.Lock()
 			f.exchanges = append(f.exchanges, body)
 			f.mu.Unlock()
+			f.book.record(body)
 			f.exchange(w, r, body)
 		case "/info":
 			var q struct {
@@ -56,8 +59,13 @@ func newFakeREST(t *testing.T, account string) *fakeREST {
 				t.Errorf("orderStatus user = %s, want %s", q.User, account)
 			}
 			f.mu.Lock()
-			if s, ok := q.OID.(string); ok {
-				f.cloids = append(f.cloids, s)
+			cloid, byCloid := q.OID.(string)
+			numeric, byOID := q.OID.(float64)
+			if byCloid {
+				f.cloids = append(f.cloids, cloid)
+			}
+			if byOID {
+				f.oids = append(f.oids, uint64(numeric))
 			}
 			unknown := f.pendingLookups > 0
 			if unknown {
@@ -68,7 +76,15 @@ func newFakeREST(t *testing.T, account string) *fakeREST {
 				fmt.Fprint(w, `{"height":8,"status":"unknownOid"}`)
 				return
 			}
-			fmt.Fprint(w, `{"height":9,"status":"order","order":{"status":"open","order":{"coin":"RBT","oid":4242}}}`)
+			if o, ok := f.book.get(cloid); ok && byCloid {
+				fmt.Fprint(w, orderStatusBody(9, "open", 4242, o))
+				return
+			}
+			oid := uint64(4242)
+			if byOID {
+				oid = uint64(numeric)
+			}
+			fmt.Fprintf(w, `{"height":9,"status":"order","order":{"status":"open","order":{"coin":"RBT","oid":%d}}}`, oid)
 		default:
 			t.Errorf("unexpected HTTP path %s", r.URL.Path)
 			http.NotFound(w, r)
@@ -123,11 +139,13 @@ func TestPlaceOverRESTReconcilesWithOrderStatus(t *testing.T) {
 	if err := json.Unmarshal(bodies[0], &sent); err != nil || len(sent.Action.Orders) != 1 || sent.Action.Orders[0].Cloid == "" {
 		t.Fatalf("sent %s (%v)", bodies[0], err)
 	}
+	// The receipt names the new order ID, so reconciliation queries that ID and
+	// never the (reusable) cloid.
 	rest.mu.Lock()
-	cloids := append([]string(nil), rest.cloids...)
+	oids, cloids := append([]uint64(nil), rest.oids...), append([]string(nil), rest.cloids...)
 	rest.mu.Unlock()
-	if len(cloids) == 0 || cloids[0] != sent.Action.Orders[0].Cloid {
-		t.Fatalf("orderStatus looked up %v, want the submitted cloid %s", cloids, sent.Action.Orders[0].Cloid)
+	if len(oids) == 0 || oids[0] != 4242 || len(cloids) != 0 {
+		t.Fatalf("orderStatus looked up oids %v cloids %v, want the receipt oid 4242 only", oids, cloids)
 	}
 	if len(client.LastOrderIDs) != 1 || client.LastOrderIDs[0] != 4242 || client.LastExecutionHeight != 9 {
 		t.Fatalf("resolved ids=%v height=%d", client.LastOrderIDs, client.LastExecutionHeight)
@@ -335,8 +353,8 @@ func TestBinWSInfoRejectsMismatchedPayload(t *testing.T) {
 }
 
 // A cloid given in the action is submitted as-is (the caller cancels or looks
-// up by it later); an order without one gets a generated cloid. Both are used
-// for the orderStatus reconciliation.
+// up by it later); an order without one gets a generated cloid. Both are
+// journaled; the receipt order IDs drive the orderStatus reconciliation.
 func TestPlaceKeepsCallerCloidAndFillsMissingOnes(t *testing.T) {
 	client := restVaultClient(t)
 	verifier := &fakeExchange{t: t, canceled: map[string]bool{}}
@@ -366,9 +384,9 @@ func TestPlaceKeepsCallerCloidAndFillsMissingOnes(t *testing.T) {
 		t.Fatalf("missing cloid not generated: %q", generated)
 	}
 	rest.mu.Lock()
-	lookups := strings.Join(rest.cloids, ",")
+	oids := fmt.Sprint(rest.oids)
 	rest.mu.Unlock()
-	if !strings.Contains(lookups, mine) || !strings.Contains(lookups, generated) {
-		t.Fatalf("orderStatus lookups %s must cover %s and %s", lookups, mine, generated)
+	if !strings.Contains(oids, "4242") || !strings.Contains(oids, "4243") {
+		t.Fatalf("orderStatus lookups %s must cover both receipt order IDs", oids)
 	}
 }

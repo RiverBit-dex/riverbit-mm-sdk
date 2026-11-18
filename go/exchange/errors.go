@@ -9,12 +9,20 @@ import (
 	"time"
 )
 
-// ErrExecutionRejected marks a request the execution layer refused as a
-// whole. Nothing ran, the pending journal entry was retired, and the next
-// request gets a new nonce. It is wrapped by the error Exchange returns when
-// a StateDir is configured; unwrap with errors.Is. Without a StateDir the
-// same condition is reported as *ActionRejectedError.
+// ErrExecutionRejected marks a request in which no leg executed: the execution
+// layer refused it as a whole, or every leg was rejected. Nothing ran, the
+// pending journal entry was retired, and the next request gets a new nonce. It
+// is wrapped by the error Exchange returns when a StateDir is configured;
+// unwrap with errors.Is. Without a StateDir the same condition is reported as
+// *ActionRejectedError. When only some legs were rejected, the error is a
+// *PartialExecutionError instead, never ErrExecutionRejected.
 var ErrExecutionRejected = errors.New("execution rejected")
+
+// CodeDuplicateNonce is the execution-layer code 205: a request with this nonce
+// was already seen. The original request may have executed, so the code is
+// never a final rejection of the action; the outcome is unknown and must be
+// reconciled.
+const CodeDuplicateNonce = 205
 
 // ErrPendingUnresolved is returned when an earlier request of the same signer
 // and account is still unresolved. Call RecoverPending before any new action.
@@ -46,6 +54,55 @@ func (e *ActionRejectedError) Error() string {
 	return fmt.Sprintf("exchange: %s %s", e.Status, e.Response)
 }
 
+// LegOutcome is the result of one leg of a request, as observed or as reported
+// in the receipt. Legs are indexed in request order.
+type LegOutcome struct {
+	Index  int    // position of the leg in the request
+	Cloid  string // client order ID of the leg, if it has one
+	OID    uint64 // order ID, zero if none is known
+	Status string // "open", "filled", "canceled", "rejected", "resting", "waitingForFill", ...
+	Error  string // rejection text, empty unless the leg was rejected
+}
+
+// PartialExecutionError reports a request that was accepted but is not a clean
+// success on every leg. Partial success is not rolled back, so it is neither a
+// success nor a rejection of the whole request: nothing may be resent blindly.
+// The pending journal entry, if any, was resolved and cleared.
+//
+// Executed lists legs that ran, Rejected the legs that did not, and Tracking
+// the legs that were accepted but wait (waitingForFill, waitingForTrigger) and
+// must be tracked through order events or orderStatus. The error is returned
+// only when at least one leg executed or needs tracking; a request in which
+// every leg was rejected is ErrExecutionRejected or *ActionRejectedError.
+type PartialExecutionError struct {
+	Nonce    uint64
+	Executed []LegOutcome
+	Rejected []LegOutcome
+	Tracking []LegOutcome
+}
+
+// Error implements error.
+func (e *PartialExecutionError) Error() string {
+	describe := func(legs []LegOutcome) string {
+		parts := make([]string, len(legs))
+		for i, l := range legs {
+			parts[i] = fmt.Sprintf("#%d", l.Index)
+			if l.Cloid != "" {
+				parts[i] += " cloid=" + l.Cloid
+			}
+			if l.OID != 0 {
+				parts[i] += fmt.Sprintf(" oid=%d", l.OID)
+			}
+			if l.Error != "" {
+				parts[i] += " (" + l.Error + ")"
+			}
+		}
+		return strings.Join(parts, "; ")
+	}
+	return fmt.Sprintf("partial execution (nonce=%d): %d executed [%s], %d rejected [%s], %d need tracking [%s]",
+		e.Nonce, len(e.Executed), describe(e.Executed), len(e.Rejected), describe(e.Rejected), len(e.Tracking), describe(e.Tracking))
+}
+
 // RateLimitError reports an HTTP 429 or a bin-ws "429" error reply. Reads
 // retry it automatically (honoring RetryAfter); it is returned when the
 // caller's context ends first, or from a write. A rate-limited write is not
@@ -66,8 +123,9 @@ func (e *RateLimitError) Error() string {
 }
 
 // UnknownOutcomeError means a signed request may or may not have executed:
-// the transport failed or timed out, the reply was malformed, or the node
-// answered with a status that asks the client to query before retrying. The
+// the transport failed or timed out, the request was redirected, the reply or
+// receipt was malformed or short, or the node answered with a status that asks
+// the client to query before retrying, such as a duplicate nonce (code 205). The
 // request must never be re-signed with a new nonce. Reconcile it by order ID
 // or client order ID; with a StateDir configured it stays in the pending
 // journal and RecoverPending resolves it.
@@ -92,7 +150,7 @@ var executionRejectionRE = regexp.MustCompile(`action rejected by execution \(co
 // ambiguousErrHints are node diagnostics for status=err replies that may still
 // carry effects: the action produced results, or a phase is only waiting. They
 // tell the caller to query the order status, so the request is not final.
-var ambiguousErrHints = []string{"query the order status", "waiting for its trigger", "not verified", "already pending"}
+var ambiguousErrHints = []string{"query the order status", "waiting for its trigger", "not verified", "already pending", "duplicate nonce", "nonce already"}
 
 // finalRejection reports whether a status=err reply means nothing executed. HTTP
 // failures never get here (they are returned as errors). A reply with a
@@ -107,7 +165,9 @@ func finalRejection(status string, response, committed json.RawMessage) (int, bo
 		return 0, committedOrderRejected(committed)
 	}
 	if code, ok := executionRejectionCode(status, response); ok {
-		return code, true
+		// A duplicate nonce says the original request was already seen; it
+		// may have executed.
+		return code, code != CodeDuplicateNonce
 	}
 	var text string
 	if json.Unmarshal(response, &text) != nil || text == "" {

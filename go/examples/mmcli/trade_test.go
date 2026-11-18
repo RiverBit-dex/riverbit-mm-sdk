@@ -58,6 +58,7 @@ type fakeGateway struct {
 	infos               []string // info types in arrival order
 	exchanges           []string // raw /exchange bodies
 	unknown             bool
+	orders              map[string]exchange.Order // order legs received, by cloid
 	orderStatusObserved chan struct{}
 }
 
@@ -72,10 +73,22 @@ func newFakeGateway(t *testing.T, account string, rest bool) *fakeGateway {
 				http.Error(w, "unexpected", http.StatusBadRequest)
 				return
 			}
+			var req struct {
+				Action exchange.Place `json:"action"`
+			}
+			_ = json.Unmarshal(body, &req)
 			g.mu.Lock()
 			g.exchanges = append(g.exchanges, string(body))
+			if g.orders == nil {
+				g.orders = map[string]exchange.Order{}
+			}
+			legs := make([]string, len(req.Action.Orders))
+			for i, o := range req.Action.Orders {
+				g.orders[o.Cloid] = o
+				legs[i] = fmt.Sprintf(`{"resting":{"oid":%d}}`, 501+i) // one status per submitted leg
+			}
 			g.mu.Unlock()
-			fmt.Fprint(w, `{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":501}},{"resting":{"oid":502}}]}}}`)
+			fmt.Fprintf(w, `{"status":"ok","response":{"type":"order","data":{"statuses":[%s]}}}`, strings.Join(legs, ","))
 			return
 		}
 		if r.URL.Path != "/info" {
@@ -123,7 +136,19 @@ func newFakeGateway(t *testing.T, account string, rest bool) *fakeGateway {
 				}
 				return
 			}
-			fmt.Fprint(w, `{"height":3,"status":"order","order":{"status":"open","order":{"coin":"BTC","oid":501}}}`)
+			if cloid, ok := q["oid"].(string); ok { // a lookup by cloid must find an order tied to the request
+				g.mu.Lock()
+				o := g.orders[cloid]
+				g.mu.Unlock()
+				side := "A"
+				if o.Buy {
+					side = "B"
+				}
+				fmt.Fprintf(w, `{"height":3,"status":"order","order":{"status":"open","order":{"coin":"BTC","oid":501,"side":%q,"limitPx":%q,"sz":%q,"timestamp":%d,"cloid":%q}}}`, side, o.Price, o.Size, time.Now().UnixMilli(), cloid)
+				return
+			}
+			oid, _ := q["oid"].(float64) // the receipt names the order IDs
+			fmt.Fprintf(w, `{"height":3,"status":"order","order":{"status":"open","order":{"coin":"BTC","oid":%d}}}`, uint64(oid))
 		default:
 			t.Errorf("unexpected info %s", body)
 		}
@@ -281,6 +306,7 @@ func TestTradeForVaultOverBinWS(t *testing.T) {
 			var q struct {
 				Type string `json:"type"`
 				User string `json:"user"`
+				OID  uint64 `json:"oid"`
 			}
 			_ = json.Unmarshal(f.Data, &q)
 			if q.User != testVault {
@@ -288,7 +314,7 @@ func TestTradeForVaultOverBinWS(t *testing.T) {
 			}
 			data := `[]`
 			if q.Type == "orderStatus" {
-				data = `{"height":3,"status":"order","order":{"status":"open","order":{"coin":"BTC","oid":501}}}`
+				data = fmt.Sprintf(`{"height":3,"status":"order","order":{"status":"open","order":{"coin":"BTC","oid":%d}}}`, q.OID)
 			}
 			_ = c.SendJSON(f.ID, fmt.Sprintf(`{"channel":"post","data":{"id":%d,"response":{"type":"info","payload":{"type":%q,"data":%s}}}}`, f.ID, q.Type, data))
 		}
@@ -309,13 +335,13 @@ func TestTradeForVaultOverBinWS(t *testing.T) {
 		`subscribe:{"type":"orderUpdates","user":"` + testVault + `"}`,
 		`subscribe:{"type":"userFills","user":"` + testVault + `"}`,
 	}
-	// subscribe, subscribe, action, orderStatus x2 (one per cloid), openOrders
+	// subscribe, subscribe, action, orderStatus x2 (one per receipt order ID), openOrders
 	if len(frames) != 6 || frames[0] != want[0] || frames[1] != want[1] || !strings.HasPrefix(frames[2], "action:") {
 		t.Fatalf("frames = %v", frames)
 	}
-	for _, f := range frames[3:5] {
-		if !strings.HasPrefix(f, `info:{"oid":"0x`) || !strings.Contains(f, `"type":"orderStatus"`) {
-			t.Fatalf("reconciliation frame = %s, want orderStatus by cloid over info_json", f)
+	for i, f := range frames[3:5] {
+		if !strings.HasPrefix(f, fmt.Sprintf(`info:{"oid":%d,`, 501+i)) || !strings.Contains(f, `"type":"orderStatus"`) {
+			t.Fatalf("reconciliation frame = %s, want orderStatus by receipt order ID over info_json", f)
 		}
 	}
 	if frames[5] != `info:{"type":"openOrders","user":"`+testVault+`"}` {

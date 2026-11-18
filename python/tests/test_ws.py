@@ -289,6 +289,33 @@ async def test_error_reply_to_an_action_is_an_unknown_outcome(test_signer: Signe
         assert isinstance(err.value.cause, PostError)
 
 
+@pytest.mark.parametrize("variant", ["wrong_type", "inner_id", "no_response", "not_post"])
+async def test_malformed_action_reply_is_an_unknown_outcome(
+    test_signer: Signer, variant: str
+) -> None:
+    async with MockBinWs(HOST) as server:
+
+        async def handler(conn: MockConn, frame: fr.ClientFrame) -> None:
+            if variant == "wrong_type":
+                await conn.post_reply(frame.id, "info", {"type": "meta", "data": {}})
+            elif variant == "inner_id":
+                bad = {"channel": "post", "data": {"id": frame.id + 5, "response": {}}}
+                await conn.send_json(frame.id, bad)
+            elif variant == "no_response":
+                await conn.send_json(frame.id, {"channel": "post", "data": {"id": frame.id}})
+            else:
+                await conn.send_json(frame.id, {"channel": "other", "data": {}})
+
+        server.handler = handler
+        async with make_session(server, test_signer) as session:
+            client = exchange_ws(session, test_signer)
+            request = client.sign(Place([ORDER]))
+            with pytest.raises(UnknownOutcome) as err:
+                await client.submit(request)
+        assert isinstance(err.value.cause, ProtocolError)
+        assert err.value.request is request and err.value.transport == "bin-ws"
+
+
 async def test_disconnect_while_waiting_is_an_unknown_outcome(test_signer: Signer) -> None:
     async with MockBinWs(HOST) as server:
 

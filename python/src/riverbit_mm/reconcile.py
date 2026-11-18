@@ -3,7 +3,8 @@
 The helpers here only **read**. They never sign, never resubmit and never
 allocate a nonce. An :class:`~riverbit_mm.UnknownOutcome` is resolved by finding
 positive evidence in ``orderStatus``; elapsed time, ``unknownOid`` and an empty
-open-order list prove nothing.
+open-order list prove nothing. A cancel request is never shown settled by its
+target's state (see :class:`Reconciliation`).
 """
 
 from __future__ import annotations
@@ -119,6 +120,9 @@ async def order_state(info: InfoSource, user: str, key: int | Cloid | str) -> Or
     raise ProtocolError(f"unexpected orderStatus status {status!r}")
 
 
+_CANCEL_ACTIONS = frozenset({"cancel", "cancelByCloid"})
+
+
 @dataclass(frozen=True)
 class Targets:
     """What a signed action is expected to leave behind, derived from its JSON."""
@@ -182,11 +186,25 @@ def targets_of(action_json: bytes) -> Targets:
 class Reconciliation:
     """The evidence gathered for one request.
 
-    ``resolved`` is true only when every target has positive evidence: each
-    placement or replacement cloid resolves to an order, and each cancellation
-    target is a current order in a terminal state. ``unresolved`` explains what is
-    still missing. When ``resolved`` is false keep the request pending and
-    conflicting writes on hold; query again later. It never means "not executed".
+    Two things are reported separately:
+
+    * ``targets_settled``: the state of what the request names. Each placement or
+      replacement cloid resolves to an order, and each cancellation or replaced
+      target is a current order in a terminal state.
+    * ``request_final``: evidence about **the request itself**. A placement or a
+      modification is shown to have run when its cloid resolves to a new order. A
+      cancellation is never shown by order state: its target may have ended through
+      a fill or another cancel while this request is still in flight, and an
+      in-flight ``cancelByCloid`` can cancel a *new* order that reuses the cloid.
+      So ``request_final`` stays false for ``cancel`` and ``cancelByCloid`` unless
+      you hold evidence about the request itself (its own receipt).
+
+    ``resolved`` is ``targets_settled and request_final``. ``unresolved`` explains
+    what is missing and ``hold_cloids`` lists the cloids the request names while it
+    is unresolved: **do not reuse a cloid while any request naming it is
+    unresolved** (best: never reuse a cloid). When ``resolved`` is false keep the
+    request pending and conflicting writes on hold; query again later. It never
+    means "not executed".
     """
 
     request_nonce: int | None
@@ -196,6 +214,9 @@ class Reconciliation:
     untracked_legs: int
     resolved: bool
     unresolved: tuple[str, ...]
+    targets_settled: bool = False
+    request_final: bool = False
+    hold_cloids: tuple[str, ...] = ()
 
 
 async def reconcile_request(
@@ -229,14 +250,27 @@ async def reconcile_request(
     for state in replaced:
         if not state.inactive:
             unresolved.append(f"{state.target}: replaced order not yet inactive ({state.status})")
+    targets_settled = not unresolved
+    # Order state says nothing about whether a cancel *request* has run or is still in
+    # flight, so a cancel is never final from reconciliation alone.
+    request_final = targets_settled and t.action_type not in _CANCEL_ACTIONS
+    if targets_settled and not request_final:
+        unresolved.append(
+            "the cancel request itself is unconfirmed: a terminal target does not show it "
+            "executed, and it may still be in flight; keep it pending and do not reuse its cloids"
+        )
+    resolved = targets_settled and request_final
     return Reconciliation(
         nonce,
         tuple(placed),
         tuple(cancels),
         tuple(replaced),
         t.untracked_legs,
-        not unresolved,
+        resolved,
         tuple(unresolved),
+        targets_settled,
+        request_final,
+        () if resolved else t.placed_cloids + t.cancel_cloids,
     )
 
 
@@ -261,14 +295,15 @@ async def wait_reconciled(
     interval: float = 0.5,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> Reconciliation:
-    """Poll :func:`reconcile_unknown` until resolved or ``timeout`` seconds pass.
+    """Poll :func:`reconcile_unknown` until its targets settle or ``timeout`` seconds pass.
 
-    Returns the last pass either way; check ``.resolved``. A timeout is not
-    evidence: leave the request pending.
+    Returns the last pass either way; check ``.resolved``. A cancel request returns
+    as soon as its target is terminal, with ``resolved`` still false (polling cannot
+    confirm the request itself). A timeout is not evidence: leave the request pending.
     """
     deadline = time.monotonic() + timeout
     while True:
         result = await reconcile_unknown(info, user, outcome)
-        if result.resolved or time.monotonic() >= deadline:
+        if result.targets_settled or time.monotonic() >= deadline:
             return result
         await sleep(interval)

@@ -4,11 +4,10 @@ package exchange
 // interrupted/ambiguous send is never retried automatically, even after restart.
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -43,6 +42,7 @@ type pendingRequest struct {
 	Account       string                   `json:"account"`
 	URL           string                   `json:"url"`
 	Nonce         uint64                   `json:"nonce"`
+	PreparedMs    int64                    `json:"prepared_ms,omitempty"`
 	Action        json.RawMessage          `json:"action"`
 	Lookups       []string                 `json:"cloids,omitempty"`
 	CancelOIDs    []uint64                 `json:"cancel_oids,omitempty"`
@@ -152,16 +152,16 @@ func (c *Client) trackedExchange(ctx context.Context, action any) error {
 	if err != nil {
 		return err
 	}
-	p := &pendingRequest{Signer: c.SignerAddress(), Transport: c.transportIdentity(), Account: c.AccountAddress(), URL: c.URL, Nonce: nonce}
+	p := &pendingRequest{Signer: c.SignerAddress(), Transport: c.transportIdentity(), Account: c.AccountAddress(), URL: c.URL, Nonce: nonce, PreparedMs: time.Now().UnixMilli()}
 	// A caller-supplied cloid is kept (the caller may cancel or look up by it later);
 	// only orders without one get a random cloid so execution can still be resolved.
 	assign := func(o *Order) error {
 		if o.Cloid == "" {
-			var b [16]byte
-			if _, err := rand.Read(b[:]); err != nil {
+			cloid, err := NewCloid()
+			if err != nil {
 				return err
 			}
-			o.Cloid = "0x" + hex.EncodeToString(b[:])
+			o.Cloid = cloid
 		}
 		p.Lookups = append(p.Lookups, o.Cloid)
 		return nil
@@ -239,7 +239,7 @@ func (c *Client) trackedExchange(ctx context.Context, action any) error {
 			p.CancelCloids = append(p.CancelCloids, x.Cloid.String())
 		}
 	default:
-		return fmt.Errorf("unsupported tracked action %T", action)
+		return fmt.Errorf("%w (got %T)", errUnsupportedAction, action)
 	}
 	if len(p.Lookups)+len(p.CancelOIDs)+len(p.CancelCloids) == 0 {
 		return fmt.Errorf("empty tracked action")
@@ -318,10 +318,11 @@ func (c *Client) trackedExchange(ctx context.Context, action any) error {
 }
 
 // classify turns a resolve error into an *UnknownOutcomeError unless it is a
-// final rejection: whenever resolve fails with the journal retained, the
+// final result (a rejection, or a partial execution): whenever resolve fails with the journal retained, the
 // request is still unresolved.
 func (c *Client) classify(p *pendingRequest, err error) error {
-	if err == nil || errors.Is(err, ErrExecutionRejected) {
+	var partial *PartialExecutionError
+	if err == nil || errors.Is(err, ErrExecutionRejected) || errors.As(err, &partial) {
 		return err
 	}
 	cloids := append(append([]string(nil), p.Lookups...), p.CancelCloids...)
@@ -332,8 +333,9 @@ func (c *Client) classify(p *pendingRequest, err error) error {
 // It only observes the old request: it queries order status and never submits,
 // re-signs or replays it. It returns nil when the request is resolved or
 // nothing is pending, an error wrapping ErrExecutionRejected when it resolved
-// into a rejection, and an *UnknownOutcomeError while evidence is missing; call
-// it again, or with a longer context. Call it at startup before readiness
+// into a rejection of every leg, a *PartialExecutionError when some legs ran
+// and some were rejected, and an *UnknownOutcomeError while evidence is
+// missing; call it again, or with a longer context. Call it at startup before readiness
 // checks, before any new action and before any shutdown cancellation.
 func (c *Client) RecoverPending(ctx context.Context) error {
 	lock := c.signerOperationLock()
@@ -361,20 +363,121 @@ func (c *Client) RecoverPending(ctx context.Context) error {
 }
 
 func (c *Client) lookup(ctx context.Context, oid any) (string, uint64, error) {
-	return c.lookupState(ctx, oid, false)
+	return c.lookupState(ctx, oid, false, nil)
+}
+
+// cloidSkew is how much older than the request an order's timestamp may be and
+// still count as this request's order: the node stamps orders with its own
+// clock, which may trail ours.
+const cloidSkew = 5 * time.Second
+
+// legBinding is what ties an order found by client order ID to one submitted
+// leg. A cloid names whichever order currently carries it, so after a reuse the
+// hit can be an older order; only an order that was created after the request
+// was journaled and that has the submitted side, price and size belongs to it.
+type legBinding struct {
+	Cloid   string
+	SinceMs int64
+	Buy     bool
+	Price   string
+	Size    string
+}
+
+func decimalEqual(a, b string) bool {
+	x, okX := new(big.Rat).SetString(a)
+	y, okY := new(big.Rat).SetString(b)
+	return okX && okY && x.Cmp(y) == 0
+}
+
+// check returns nil when the order is this request's order.
+func (b *legBinding) check(side, price, size, origSize, cloid string, timestamp json.Number) error {
+	ts, err := timestamp.Int64()
+	if err != nil || ts <= 0 {
+		return fmt.Errorf("order has no usable timestamp")
+	}
+	if ts < b.SinceMs-cloidSkew.Milliseconds() {
+		return fmt.Errorf("order is older than the request (a reused cloid?)")
+	}
+	if cloid != "" && !strings.EqualFold(cloid, b.Cloid) {
+		return fmt.Errorf("order carries a different cloid")
+	}
+	if (side != "B" && side != "A") || (side == "B") != b.Buy {
+		return fmt.Errorf("order side does not match the submitted leg")
+	}
+	if !decimalEqual(price, b.Price) {
+		return fmt.Errorf("order price does not match the submitted leg")
+	}
+	if origSize != "" {
+		if !decimalEqual(origSize, b.Size) {
+			return fmt.Errorf("order size does not match the submitted leg")
+		}
+		return nil
+	}
+	remaining, ok := new(big.Rat).SetString(size)
+	submitted, okSubmitted := new(big.Rat).SetString(b.Size)
+	if !ok || !okSubmitted || remaining.Sign() < 0 || remaining.Cmp(submitted) > 0 {
+		return fmt.Errorf("order size does not match the submitted leg")
+	}
+	return nil
+}
+
+// legBindings returns the binding of every order leg of the journaled action,
+// in p.Lookups order.
+func (p *pendingRequest) legBindings() ([]legBinding, error) {
+	if len(p.Lookups) == 0 {
+		return nil, nil
+	}
+	action, err := ParseAction(p.Action)
+	if err != nil {
+		return nil, fmt.Errorf("pending retained: unreadable action: %w", err)
+	}
+	var orders []Order
+	switch a := action.(type) {
+	case *Place:
+		orders = a.Orders
+	case *Modify:
+		orders = []Order{a.Order}
+	case *BatchModify:
+		for _, m := range a.Modifies {
+			orders = append(orders, m.Order)
+		}
+	}
+	if len(orders) != len(p.Lookups) {
+		return nil, fmt.Errorf("pending retained: action/lookup mismatch")
+	}
+	since := p.PreparedMs
+	if since == 0 {
+		since = int64(p.Nonce) // the nonce is a millisecond timestamp
+	}
+	out := make([]legBinding, len(orders))
+	for i, o := range orders {
+		if o.Cloid != p.Lookups[i] {
+			return nil, fmt.Errorf("pending retained: action/lookup mismatch")
+		}
+		out[i] = legBinding{Cloid: o.Cloid, SinceMs: since, Buy: o.Buy, Price: o.Price, Size: o.Size}
+	}
+	return out, nil
 }
 
 // A legResult can prove an order was placed/filled, but cannot prove it is no
 // longer live: a filled leg may have left a resting remainder. Cancellation
 // reconciliation therefore requires the actual current order object.
-func (c *Client) lookupState(ctx context.Context, oid any, requireOrder bool) (string, uint64, error) {
+//
+// With a non-nil bind (a lookup by cloid for a submitted order leg) the order
+// found must also be tied to this request, see legBinding; a legResult carries
+// no order to compare and cannot be tied, so it leaves the request pending.
+func (c *Client) lookupState(ctx context.Context, oid any, requireOrder bool, bind *legBinding) (string, uint64, error) {
 	var out struct {
 		Height uint64          `json:"height"`
 		Status string          `json:"status"`
 		Leg    json.RawMessage `json:"leg"`
 		Order  struct {
-			Status string    `json:"status"`
-			Order  OpenOrder `json:"order"`
+			Status string `json:"status"`
+			Order  struct {
+				OpenOrder
+				OrigSize  string      `json:"origSz"`
+				Timestamp json.Number `json:"timestamp"`
+			} `json:"order"`
 		} `json:"order"`
 	}
 	err := c.orderQuery(ctx, map[string]any{"type": "orderStatus", "user": c.AccountAddress(), "oid": oid}, &out)
@@ -400,6 +503,9 @@ func (c *Client) lookupState(ctx context.Context, oid any, requireOrder bool) (s
 		if requireOrder {
 			return "", 0, fmt.Errorf("orderStatus lacks current order state")
 		}
+		if bind != nil {
+			return "", 0, fmt.Errorf("orderStatus by cloid returned a legResult, which cannot be tied to this request")
+		}
 		var leg struct {
 			Resting *struct {
 				OID uint64 `json:"oid"`
@@ -423,13 +529,19 @@ func (c *Client) lookupState(ctx context.Context, oid any, requireOrder bool) (s
 		}
 		return "", 0, fmt.Errorf("nonterminal or invalid legResult")
 	}
-	if out.Status != "order" || !knownOrderState(out.Order.Status) || out.Order.Order.OID == 0 {
+	order := out.Order.Order
+	if out.Status != "order" || !knownOrderState(out.Order.Status) || order.OID == 0 {
 		return "", 0, fmt.Errorf("invalid orderStatus response")
 	}
-	if id, ok := oid.(uint64); ok && id != out.Order.Order.OID {
+	if id, ok := oid.(uint64); ok && id != order.OID {
 		return "", 0, fmt.Errorf("orderStatus returned a different oid")
 	}
-	return finish(out.Order.Status, out.Order.Order.OID)
+	if bind != nil {
+		if err := bind.check(order.Side, order.Price, order.Size, order.OrigSize, order.Cloid, order.Timestamp); err != nil {
+			return "", 0, fmt.Errorf("order %d is not tied to this request: %w", order.OID, err)
+		}
+	}
+	return finish(out.Order.Status, order.OID)
 }
 
 func (c *Client) resolve(ctx context.Context, p *pendingRequest) error {
@@ -447,19 +559,42 @@ func (c *Client) resolve(ctx context.Context, p *pendingRequest) error {
 	}
 	var receiptLegs []batchLeg
 	if len(p.BatchReceipt) > 0 {
-		var batch BatchModify
-		if json.Unmarshal(p.Action, &batch) != nil || batch.Type != "batchModify" || len(batch.Modifies) != len(p.Lookups) || len(p.CancelOIDs) != len(p.Lookups) {
+		action, err := ParseAction(p.Action)
+		if err != nil {
 			return fmt.Errorf("pending retained: batch receipt/action mismatch")
 		}
-		for i, m := range batch.Modifies {
-			if m.Order.Cloid != p.Lookups[i] || m.OID != p.CancelOIDs[i] {
-				return fmt.Errorf("pending retained: batch receipt/lookup mismatch")
+		switch a := action.(type) {
+		case *BatchModify:
+			if len(a.Modifies) != len(p.Lookups) || len(p.CancelOIDs) != len(p.Lookups) {
+				return fmt.Errorf("pending retained: batch receipt/action mismatch")
 			}
+			for i, m := range a.Modifies {
+				if m.Order.Cloid != p.Lookups[i] || m.OID != p.CancelOIDs[i] {
+					return fmt.Errorf("pending retained: batch receipt/lookup mismatch")
+				}
+			}
+		case *Place:
+			if len(a.Orders) != len(p.Lookups) || len(p.CancelOIDs) != 0 {
+				return fmt.Errorf("pending retained: batch receipt/action mismatch")
+			}
+			for i, o := range a.Orders {
+				if o.Cloid != p.Lookups[i] {
+					return fmt.Errorf("pending retained: batch receipt/lookup mismatch")
+				}
+			}
+		default:
+			return fmt.Errorf("pending retained: batch receipt/action mismatch")
 		}
-		var err error
 		receiptLegs, err = parseBatchReceipt(p.BatchReceipt, len(p.Lookups))
 		if err != nil {
 			return fmt.Errorf("pending retained: %w", err)
+		}
+	}
+	var bindings []legBinding
+	if len(p.Lookups) > 0 && len(receiptLegs) == 0 {
+		var err error
+		if bindings, err = p.legBindings(); err != nil {
+			return err
 		}
 	}
 	// Only evidence for this journal's queries can participate in recovery.
@@ -498,6 +633,7 @@ func (c *Client) resolve(ctx context.Context, p *pendingRequest) error {
 		var statuses []string
 		var ids []uint64
 		var states []string
+		var legs []LegOutcome
 		rejected := false
 		lookupFailed := false
 		lookupCtx, stopLookups := context.WithTimeout(ctx, lookupPassTimeout)
@@ -513,18 +649,24 @@ func (c *Client) resolve(ctx context.Context, p *pendingRequest) error {
 		for i, cloid := range p.Lookups {
 			if len(receiptLegs) > 0 && receiptLegs[i].Error != "" {
 				statuses = append(statuses, fmt.Sprintf("cloid=%s rejected: %s", cloid, receiptLegs[i].Error))
+				legs = append(legs, LegOutcome{Index: i, Cloid: cloid, Status: "rejected", Error: receiptLegs[i].Error})
 				rejected = true
 				continue
 			}
+			// A receipt names the order by its new order ID, which cannot be
+			// reused; without one the cloid lookup must be tied to this leg.
 			var key any = cloid
+			var bind *legBinding
 			if len(receiptLegs) > 0 {
 				key = receiptLegs[i].OID
+			} else {
+				bind = &bindings[i]
 			}
 			evidenceKey := "order:" + cloid
 			evidence, known := p.Evidence[evidenceKey]
 			var err error
 			if !known {
-				evidence.Status, evidence.OID, err = c.lookup(lookupCtx, key)
+				evidence.Status, evidence.OID, err = c.lookupState(lookupCtx, key, false, bind)
 			}
 			s, oid := evidence.Status, evidence.OID
 			// A reused cloid can still name the old, canceled order while the
@@ -548,8 +690,13 @@ func (c *Client) resolve(ctx context.Context, p *pendingRequest) error {
 				ids = append(ids, oid)
 				states = append(states, s)
 			}
-			if strings.Contains(strings.ToLower(s), "reject") {
-				rejected = true
+			if s != "" {
+				leg := LegOutcome{Index: i, Cloid: cloid, OID: oid, Status: s}
+				if strings.Contains(strings.ToLower(s), "reject") {
+					leg.Error = "order status " + s
+					rejected = true
+				}
+				legs = append(legs, leg)
 			}
 			if lookupCtx.Err() != nil {
 				done, lookupFailed = false, true
@@ -559,6 +706,7 @@ func (c *Client) resolve(ctx context.Context, p *pendingRequest) error {
 		for i, oid := range p.CancelOIDs {
 			if len(cancelErrors) > 0 && cancelErrors[i] != "" {
 				statuses = append(statuses, fmt.Sprintf("cancel oid=%d rejected: %s", oid, cancelErrors[i]))
+				legs = append(legs, LegOutcome{Index: i, OID: oid, Status: "rejected", Error: cancelErrors[i]})
 				rejected = true
 				continue
 			}
@@ -571,7 +719,7 @@ func (c *Client) resolve(ctx context.Context, p *pendingRequest) error {
 			evidence, known := p.Evidence[evidenceKey]
 			var err error
 			if !known {
-				evidence.Status, evidence.OID, err = c.lookupState(lookupCtx, oid, true)
+				evidence.Status, evidence.OID, err = c.lookupState(lookupCtx, oid, true, nil)
 			}
 			s := evidence.Status
 			if err != nil {
@@ -583,6 +731,9 @@ func (c *Client) resolve(ctx context.Context, p *pendingRequest) error {
 				remember(evidenceKey, s, evidence.OID)
 			}
 			statuses = append(statuses, fmt.Sprintf("oid=%d status=%s", oid, s))
+			if len(p.Lookups) == 0 && err == nil && inactiveOrder(s) { // a modify's cancel is part of its replacement leg
+				legs = append(legs, LegOutcome{Index: i, OID: oid, Status: s})
+			}
 			if lookupCtx.Err() != nil {
 				done, lookupFailed = false, true
 				break
@@ -591,6 +742,7 @@ func (c *Client) resolve(ctx context.Context, p *pendingRequest) error {
 		for i, cloid := range p.CancelCloids {
 			if len(cancelErrors) > 0 && cancelErrors[i] != "" {
 				statuses = append(statuses, fmt.Sprintf("cancel cloid=%s rejected: %s", cloid, cancelErrors[i]))
+				legs = append(legs, LegOutcome{Index: i, Cloid: cloid, Status: "rejected", Error: cancelErrors[i]})
 				rejected = true
 				continue
 			}
@@ -598,7 +750,7 @@ func (c *Client) resolve(ctx context.Context, p *pendingRequest) error {
 			evidence, known := p.Evidence[evidenceKey]
 			var err error
 			if !known {
-				evidence.Status, evidence.OID, err = c.lookupState(lookupCtx, cloid, true)
+				evidence.Status, evidence.OID, err = c.lookupState(lookupCtx, cloid, true, nil)
 			}
 			s := evidence.Status
 			if err != nil {
@@ -610,6 +762,9 @@ func (c *Client) resolve(ctx context.Context, p *pendingRequest) error {
 				remember(evidenceKey, s, evidence.OID)
 			}
 			statuses = append(statuses, fmt.Sprintf("cancel_cloid=%s status=%s", cloid, s))
+			if err == nil && inactiveOrder(s) {
+				legs = append(legs, LegOutcome{Index: i, Cloid: cloid, OID: evidence.OID, Status: s})
+			}
 			if lookupCtx.Err() != nil {
 				done, lookupFailed = false, true
 				break
@@ -629,7 +784,19 @@ func (c *Client) resolve(ctx context.Context, p *pendingRequest) error {
 			c.logInfo("execution observed", "account", p.Account, "nonce", p.Nonce, "detail", detail)
 			c.LastOrderIDs, c.LastStatuses = ids, states
 			if rejected {
-				return fmt.Errorf("%w nonce=%d: %s", ErrExecutionRejected, p.Nonce, detail)
+				partial := &PartialExecutionError{Nonce: p.Nonce}
+				for _, leg := range legs {
+					if leg.Error != "" {
+						partial.Rejected = append(partial.Rejected, leg)
+					} else {
+						partial.Executed = append(partial.Executed, leg)
+					}
+				}
+				if len(partial.Executed) == 0 {
+					// No leg ran: the request as a whole was rejected.
+					return fmt.Errorf("%w nonce=%d: %s", ErrExecutionRejected, p.Nonce, detail)
+				}
+				return partial
 			}
 			return nil
 		}

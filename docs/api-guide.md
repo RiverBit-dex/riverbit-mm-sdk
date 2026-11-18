@@ -8,9 +8,9 @@ This guide covers market and account queries, signing and submitting orders, can
 |---|---|---|
 | Queries | `https://pre-api.riverbit.io/info` | HTTP POST JSON |
 | Trading | `https://pre-api.riverbit.io/exchange` | HTTP POST signed JSON |
-| Market data, events, trading and info | `wss://pre-api.riverbit.io/bin-ws` | WebSocket binary Protobuf frames |
+| Market data, events and info | `wss://pre-api.riverbit.io/bin-ws` | WebSocket binary Protobuf frames |
 
-Replace the host when switching environments. REST `/info` supports metadata, book and account queries; `/exchange` accepts signed actions. bin-ws supports `l2`, `l2Book`, `bbo`, `trades`, `candle`, account subscriptions and `info_json` queries. Its `action_json` uses the same signed request bytes as REST. `metaAndAssetCtxs`, `userRole` and `leadingVaults` must use REST.
+Replace the host when switching environments. REST `/info` supports metadata, book and account queries; `/exchange` accepts signed actions. bin-ws supports `l2`, `l2Book`, `bbo`, `trades`, `candle`, account subscriptions and `info_json` queries. **Send orders, cancellations and modifications over REST `/exchange`.** The frame format defines `action_json` (the same signed request bytes as REST), but the public bin-ws endpoint does not accept it: the server replies `504 Gateway Timeout`. Treat such a reply as an unknown outcome and reconcile; do not resend. `metaAndAssetCtxs`, `userRole` and `leadingVaults` must use REST.
 
 All `/info` queries are POST JSON with a `type` field:
 
@@ -36,7 +36,7 @@ An API wallet signs; the master address identifies the account for queries and s
 2. Query `userRole` with the API wallet; record the master address. For vault trading query `leadingVaults` for the master.
 3. Query `metaAndAssetCtxs` on each startup. The target's index in `universe` is order field `a`; `szDecimals` determines precision. Do not hard-code the index.
 4. Connect to bin-ws, log in as the first frame, then subscribe to market and order/fill streams.
-5. Construct and sign an action; submit over REST or bin-ws. Inspect every receipt leg and reconcile using order updates or `orderStatus`.
+5. Construct and sign an action; submit it with REST `POST /exchange`. Inspect every receipt leg and reconcile using order updates or `orderStatus`.
 
 ## 3. Signing
 
@@ -127,7 +127,7 @@ Perpetual order constraints:
 - Notional is valuation price times size: for buys use min(limit, best ask); for sells max(limit, best bid). At or below $9.999999 is rejected; exactly $10 passes. Modifications are subject to the same check.
 - Every limit order submitted on behalf of a Guild vault must use `Alo`, including replacement orders. A `Gtc` leg rejects the **entire action** with code 1160 and no statuses; master-account orders have no such Guild restriction.
 
-Send the signed body via POST `/exchange` or as UTF-8 `action_json` with a nonzero frame id. Inspect **every** `statuses[]` leg. `resting` means placed with no fills; `filled` includes decimal `totalSz` and `avgPx`, but may still have remaining open size, so use `orderStatus`; `waitingForTrigger` / `waitingForFill` need tracking; an `error` is a rejected leg. Whole-action rejections have `status=err` and no `statuses`. An incomplete receipt rendering may include `localCommitted` and does not prove failure: query before deciding the next step, and never simply resend under a new nonce.
+Send the signed body via POST `/exchange`. Inspect **every** `statuses[]` leg. `resting` means placed with no fills; `filled` includes decimal `totalSz` and `avgPx`, but may still have remaining open size, so use `orderStatus`; `waitingForTrigger` / `waitingForFill` need tracking; an `error` is a rejected leg. Whole-action rejections have `status=err` and no `statuses`. An incomplete receipt rendering may include `localCommitted` and does not prove failure: query before deciding the next step, and never simply resend under a new nonce.
 
 ## 7. Cancel
 

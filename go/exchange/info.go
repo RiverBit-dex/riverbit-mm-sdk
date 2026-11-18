@@ -166,14 +166,26 @@ func postJSON(ctx context.Context, client *http.Client, base, path string, body,
 	return postRaw(ctx, client, base, path, data, out)
 }
 
-// postRaw POSTs data unchanged to base+path.
+// noRedirect makes an http.Client return a 3xx answer as is instead of
+// following it.
+func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+// postRaw POSTs data unchanged to base+path. It never follows a redirect, even
+// when the caller's client would: a signed body must go only to the URL it was
+// built for, and a 3xx answer counts as a failed request (for /exchange, an
+// unknown outcome, since the body already left the process).
 func postRaw(ctx context.Context, client *http.Client, base, path string, data []byte, out any) error {
 	req, err := http.NewRequestWithContext(ctx, "POST", base+path, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	noFollow := *client // a copy: the caller's client keeps its own policy
+	noFollow.CheckRedirect = noRedirect
+	resp, err := noFollow.Do(req)
 	if err != nil {
 		return err
 	}

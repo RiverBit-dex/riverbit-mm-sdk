@@ -314,6 +314,12 @@ async fn failures_on_a_write_are_unknown_outcomes_with_the_signed_bytes() {
             HttpReply::ok(r#"{"status":"err","response":"action already pending"}"#),
             UnknownReason::AmbiguousReceipt,
         ),
+        (
+            HttpReply::ok(
+                r#"{"status":"err","response":"action rejected by execution (code 205): duplicate nonce"}"#,
+            ),
+            UnknownReason::AmbiguousReceipt,
+        ),
     ];
     for (reply, reason) in cases {
         let (status, body, headers) = (reply.status, reply.body.clone(), reply.headers.clone());
@@ -457,4 +463,50 @@ async fn reconcile_an_unknown_outcome() {
         reconcile(&info, &user(), err.as_unknown_outcome().unwrap()).await,
         Err(Error::InvalidInput(_))
     ));
+}
+
+#[tokio::test]
+async fn a_signed_post_is_never_redirected() {
+    for status in [301u16, 302, 307, 308] {
+        let target = http_server(|_, _| HttpReply::ok(RESTING)).await;
+        let location = format!("{}/exchange", target.base_url);
+        let origin = http_server(move |_, _| {
+            HttpReply::status(status, "moved").with_header("location", &location)
+        })
+        .await;
+        let ex = exchange(&origin.base_url);
+        let request = ex.prepare(&place_one()).unwrap();
+        let err = ex.submit(&request).await.unwrap_err();
+        let unknown = err
+            .as_unknown_outcome()
+            .unwrap_or_else(|| panic!("{err:?}"));
+        assert_eq!(unknown.reason, UnknownReason::HttpStatus(status));
+        assert_eq!(unknown.request.body(), request.body());
+        assert!(
+            target.requests.lock().unwrap().is_empty(),
+            "the signed body must not reach the redirect target ({status})"
+        );
+        assert_eq!(origin.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_client_that_follows_redirects_does_not_yield_a_receipt() {
+    // A caller-supplied client that follows redirects: the body is already
+    // gone, but the answer of another URL is not taken for the answer.
+    let target = http_server(|_, _| HttpReply::ok(RESTING)).await;
+    let location = format!("{}/exchange", target.base_url);
+    let origin =
+        http_server(move |_, _| HttpReply::status(307, "").with_header("location", &location))
+            .await;
+    let following = reqwest::Client::new();
+    let ex = ExchangeClient::with_http_client(
+        &origin.base_url,
+        signer(),
+        SigningDomain::new(12589),
+        Some(following),
+    )
+    .unwrap();
+    let err = ex.send(&place_one()).await.unwrap_err();
+    assert!(err.is_unknown_outcome(), "{err:?}");
 }

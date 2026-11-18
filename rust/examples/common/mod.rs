@@ -1,9 +1,10 @@
-//! Shared setup for the examples. Everything comes from environment
-//! variables; the private key is never taken from the command line.
+//! Shared setup for the examples. Settings come from environment variables;
+//! the private key is read from a file, never from the command line or an
+//! environment variable, so it does not end up in shell history or `ps`.
 //!
 //! | Variable | Meaning | Default |
 //! |---|---|---|
-//! | `RIVERBIT_PRIVATE_KEY` | API wallet (or master) private key, hex | required |
+//! | `RIVERBIT_KEY_FILE` | path of a file holding the API wallet (or master) private key, hex, one line | required |
 //! | `RIVERBIT_BASE_URL` | REST base URL | `https://pre-api.riverbit.io` |
 //! | `RIVERBIT_WS_URL` | bin-ws URL | `wss://pre-api.riverbit.io/bin-ws` |
 //! | `RIVERBIT_LOGIN_HOST` | host line of the login message | `pre-api.riverbit.io` |
@@ -35,13 +36,18 @@ pub fn required(name: &str) -> String {
 
 impl Env {
     pub fn load() -> Env {
-        let key = required("RIVERBIT_PRIVATE_KEY");
+        let path = required("RIVERBIT_KEY_FILE");
+        let key = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            eprintln!("cannot read the key file named by RIVERBIT_KEY_FILE: {e}");
+            std::process::exit(2)
+        });
         Env {
             base_url: var("RIVERBIT_BASE_URL", "https://pre-api.riverbit.io"),
             ws_url: var("RIVERBIT_WS_URL", "wss://pre-api.riverbit.io/bin-ws"),
             login_host: var("RIVERBIT_LOGIN_HOST", "pre-api.riverbit.io"),
             coin: var("RIVERBIT_COIN", "BTC"),
-            signer: Signer::from_hex(&key).expect("RIVERBIT_PRIVATE_KEY must be 32 bytes of hex"),
+            signer: Signer::from_hex(&key)
+                .expect("the key file must hold the private key as 32 bytes of hex"),
         }
     }
 

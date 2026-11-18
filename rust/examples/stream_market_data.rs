@@ -2,7 +2,7 @@
 //! and ask whenever they change.
 //!
 //! ```text
-//! RIVERBIT_PRIVATE_KEY=0x... cargo run --example stream_market_data
+//! RIVERBIT_KEY_FILE=./key cargo run --example stream_market_data
 //! ```
 //!
 //! Market data needs no account authority, but every connection still logs in

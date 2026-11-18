@@ -83,7 +83,8 @@ impl SigningDomain {
 }
 
 /// An ECDSA trading signature as sent in the request: `r`, `s` and `v` (27 or 28).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `Debug` does not print the signature.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ActionSignature {
     /// 32-byte `r`.
     pub r: [u8; 32],
@@ -91,6 +92,14 @@ pub struct ActionSignature {
     pub s: [u8; 32],
     /// 27 or 28.
     pub v: u8,
+}
+
+impl fmt::Debug for ActionSignature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ActionSignature")
+            .field("v", &self.v)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ActionSignature {
@@ -291,7 +300,8 @@ impl SignedRequest {
 }
 
 impl fmt::Debug for SignedRequest {
-    // The body is replayable; keep it out of logs by default.
+    // The body and signature are replayable; keep them out of logs. Shows the
+    // action kind, nonce and signer, which identify the request.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SignedRequest")
             .field("kind", &self.info.kind)
@@ -406,4 +416,89 @@ fn word(n: u64) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[24..].copy_from_slice(&n.to_be_bytes());
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actions::{Action, Order, Place, Tif};
+    use crate::error::{Error, UnknownOutcome, UnknownReason};
+
+    const KEY: &str = "0x0101010101010101010101010101010101010101010101010101010101010101";
+
+    fn signed() -> (SignedRequest, ActionSignature) {
+        let signer = Signer::from_hex(KEY).unwrap();
+        let place = Place::new(vec![Order::limit(1, true, "80000", "0.001", Tif::Alo)]);
+        let domain = SigningDomain::new(12589);
+        let json = place.to_json().unwrap();
+        let signature = signer.sign_action(&json, 42, None, &domain).unwrap();
+        let request = signer
+            .sign_request(
+                json,
+                42,
+                None,
+                &domain,
+                ActionInfo {
+                    kind: place.kind(),
+                    expected_legs: place.expected_legs(),
+                    targets: place.targets(),
+                },
+            )
+            .unwrap();
+        (request, signature)
+    }
+
+    #[test]
+    fn debug_output_never_shows_keys_bodies_or_signatures() {
+        let (request, signature) = signed();
+        let signer = Signer::from_hex(KEY).unwrap();
+        let unknown = UnknownOutcome {
+            request: request.clone(),
+            reason: UnknownReason::Timeout,
+            legs: vec![],
+            reply: None,
+        };
+        let error = Error::UnknownOutcome(Box::new(unknown.clone()));
+        let not_sent = Error::NotSent {
+            request: Box::new(request.clone()),
+            reason: "queued".into(),
+        };
+        let login = signer.sign_login("host.example", 1, [7; 16]).unwrap();
+        let outputs = [
+            format!("{request:?}"),
+            format!("{request:#?}"),
+            format!("{unknown:?}"),
+            format!("{error:?}"),
+            format!("{error}"),
+            format!("{not_sent:?}"),
+            format!("{not_sent}"),
+            format!("{signer:?}"),
+            format!("{signature:?}"),
+            format!("{login:?}"),
+        ];
+        let secrets = [
+            "0101010101010101010101010101010101010101010101010101010101010101".to_string(),
+            hex::encode(signature.r),
+            hex::encode(signature.s),
+            hex::encode(login.signature),
+            "80000".to_string(),
+            "\"signature\"".to_string(),
+            "\"action\"".to_string(),
+        ];
+        for out in &outputs {
+            for secret in &secrets {
+                assert!(!out.contains(secret), "{out} leaks {secret}");
+            }
+        }
+        // The identifying fields are there.
+        let shown = format!("{request:?}");
+        assert!(shown.contains("42"), "{shown}");
+        assert!(
+            shown.contains("Place") || shown.contains("Order"),
+            "{shown}"
+        );
+        assert!(shown.contains(&signer.address().to_string()), "{shown}");
+        assert!(format!("{signer:?}").contains(&signer.address().to_string()));
+        assert!(format!("{error}").contains("42"));
+    }
 }

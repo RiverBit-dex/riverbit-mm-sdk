@@ -36,11 +36,19 @@ var ErrNoChainID = errors.New("SignChainID is not set: query chainIdentity and s
 type Client struct {
 	// URL is the REST base URL, for example "https://pre-api.riverbit.io".
 	URL string
-	// HTTP is the HTTP client used for REST; New sets one with a 15 second timeout.
+	// HTTP is the HTTP client used for REST; New sets one with a 15 second
+	// timeout. Whatever client is set here, the SDK never follows a redirect for
+	// a request it sends: a 3xx answer to POST /exchange is an unknown outcome.
 	HTTP *http.Client
 	// WS, when set, carries signed actions over a logged-in bin-ws session
 	// (action_json) instead of POST <URL>/exchange. Both paths send the same
 	// signed bytes. *binws.Session implements ActionTransport.
+	//
+	// The public RiverBit /bin-ws endpoint does not accept action_json: it
+	// answers 504 Gateway Timeout, which is an unknown outcome here. Leave WS
+	// nil to submit orders over REST POST /exchange, which is the supported
+	// path; use bin-ws for market data, order and fill events and Queries.
+	// WS exists for gateways that do accept order entry on bin-ws.
 	WS ActionTransport
 	// Queries, when set, carries the reconciliation queries (orderStatus,
 	// openOrders) over bin-ws info_json instead of POST <URL>/info. Startup
@@ -90,7 +98,7 @@ func New(url string, signer *Signer) (*Client, error) {
 	if signer == nil || signer.key == nil {
 		return nil, fmt.Errorf("signer is required")
 	}
-	return &Client{URL: strings.TrimRight(url, "/"), HTTP: &http.Client{Timeout: 15 * time.Second}, signer: signer}, nil
+	return &Client{URL: strings.TrimRight(url, "/"), HTTP: &http.Client{Timeout: 15 * time.Second, CheckRedirect: noRedirect}, signer: signer}, nil
 }
 
 // NewForVault returns a Client that signs as signer for a vault. signer must be
@@ -278,7 +286,47 @@ func (c *Client) connectionID(action any, nonce uint64) ([]byte, error) {
 	return hash(buf.Bytes()), nil
 }
 
+// errUnsupportedAction is returned for anything but the SDK's ordered action
+// types: signing and sending must serialize the very same ordered value.
+var errUnsupportedAction = errors.New("unsupported action: sign only the SDK action types (*Place, *Cancel, *CancelByCloid, *Modify, *BatchModify, or their values), or the result of ParseAction")
+
+// checkSignable accepts the action types whose struct field order defines both
+// the MessagePack image that is signed and the JSON body that is sent. Maps,
+// json.RawMessage, byte slices and other types have no such guarantee: Go would
+// sort map keys in JSON but not in MessagePack, and raw JSON bytes would be
+// signed as an opaque string.
+func checkSignable(action any) error {
+	switch a := action.(type) {
+	case Place, Cancel, CancelByCloid, Modify, BatchModify:
+		return nil
+	case *Place:
+		if a != nil {
+			return nil
+		}
+	case *Cancel:
+		if a != nil {
+			return nil
+		}
+	case *CancelByCloid:
+		if a != nil {
+			return nil
+		}
+	case *Modify:
+		if a != nil {
+			return nil
+		}
+	case *BatchModify:
+		if a != nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w (got %T)", errUnsupportedAction, action)
+}
+
 func (c *Client) signingDigest(action any, nonce uint64) ([]byte, error) {
+	if err := checkSignable(action); err != nil {
+		return nil, err
+	}
 	if c.SignChainID == 0 {
 		return nil, ErrNoChainID
 	}
@@ -292,7 +340,13 @@ func (c *Client) signingDigest(action any, nonce uint64) ([]byte, error) {
 
 // Sign signs action with nonce: the EIP-712 phantom-agent signature over the
 // connection ID of the MessagePack-encoded action, bound to the client's vault
-// or subaccount if it has one. Send the same action bytes you signed.
+// or subaccount if it has one. Send the same action bytes you signed: use
+// SignedRequest to get the complete body.
+//
+// action must be one of the SDK's ordered action types (*Place, *Cancel,
+// *CancelByCloid, *Modify, *BatchModify or their values), for example the
+// result of ParseAction. Anything else, including a map or json.RawMessage,
+// is refused, because its JSON and MessagePack encodings could differ.
 func (c *Client) Sign(action any, nonce uint64) (Signature, error) {
 	digest, err := c.signingDigest(action, nonce)
 	if err != nil {
@@ -310,7 +364,8 @@ type requestEnvelope struct {
 }
 
 // SignedRequest signs action with nonce and returns the complete request body:
-// the exact bytes to POST to /exchange or to send as bin-ws action_json.
+// the exact bytes to POST to /exchange or to send as bin-ws action_json. The
+// same restriction as Sign applies: the action must be an SDK action type.
 func (c *Client) SignedRequest(action any, nonce uint64) ([]byte, error) {
 	sig, err := c.Sign(action, nonce)
 	if err != nil {
@@ -393,9 +448,12 @@ func (c *Client) OpenOrders(ctx context.Context) ([]OpenOrder, error) {
 // action is a *Place, *Cancel, *CancelByCloid, *Modify or *BatchModify (the
 // value forms work too).
 //
-// It returns nil only when the action is known to have executed. A whole-action
-// rejection is an *ActionRejectedError, or wraps ErrExecutionRejected when a
-// StateDir is configured. If the outcome is unknown it returns an
+// It returns nil only when the action is known to have executed on every leg.
+// A rejection in which no leg ran is an *ActionRejectedError, or wraps
+// ErrExecutionRejected when a StateDir is configured. If some legs ran and
+// others were rejected or wait for a fill or trigger, it returns a
+// *PartialExecutionError that lists them per leg; partial success is not rolled
+// back. If the outcome is unknown it returns an
 // *UnknownOutcomeError; the request is never re-signed or resent. With a
 // StateDir the request stays in the pending journal until RecoverPending
 // resolves it, and a new Exchange is refused until then.
@@ -522,7 +580,7 @@ func (c *Client) submit(ctx context.Context, action any, n uint64, s Signature) 
 	}
 	c.LastReceipt, _ = ParseReceipt(reply)
 	// Preserve complete per-leg results before an individual error discards
-	// them. A rejected replacement has no new cloid to discover via /info.
+	// them. A rejected leg has no cloid to discover via /info.
 	if c.StateDir != "" {
 		count := 0
 		switch batch := action.(type) {
@@ -530,6 +588,10 @@ func (c *Client) submit(ctx context.Context, action any, n uint64, s Signature) 
 			count = len(batch.Modifies)
 		case *BatchModify:
 			count = len(batch.Modifies)
+		case Place:
+			count = len(batch.Orders)
+		case *Place:
+			count = len(batch.Orders)
 		}
 		raw := result.Response
 		if result.Status == "err" {
@@ -569,30 +631,101 @@ func (c *Client) submit(ctx context.Context, action any, n uint64, s Signature) 
 		}
 		return c.unknown(action, n, fmt.Errorf("exchange missing statuses: %s", result.Response))
 	}
-	for _, raw := range response.Data.Statuses {
-		if string(raw) == `"success"` {
-			continue
+	return c.judgeLegs(action, n, response.Data.Statuses)
+}
+
+// judgeLegs turns the statuses of an accepted reply into one outcome. The
+// receipt must carry exactly one well-formed status per submitted leg; a short
+// or malformed one is an unknown outcome, not a success. A reply that is clean
+// on every leg returns nil. Rejected legs and legs that wait (waitingForFill,
+// waitingForTrigger) return a *PartialExecutionError so the caller sees which
+// legs ran and which must be tracked; when every leg was rejected nothing ran
+// and the result is an *ActionRejectedError.
+func (c *Client) judgeLegs(action any, n uint64, statuses []json.RawMessage) error {
+	want, cloids, cancels := expectedLegs(action)
+	if want == 0 || len(statuses) != want {
+		return c.unknown(action, n, fmt.Errorf("exchange receipt has %d statuses for %d legs", len(statuses), want))
+	}
+	partial := &PartialExecutionError{Nonce: n}
+	for i, raw := range statuses {
+		leg := parseLeg(raw)
+		out := LegOutcome{Index: i, OID: leg.OID, Status: leg.Kind}
+		if i < len(cloids) {
+			out.Cloid = cloids[i]
 		}
-		var status struct {
-			Error   string `json:"error"`
-			Resting *struct {
-				OID uint64 `json:"oid"`
-			} `json:"resting"`
-			Filled *struct {
-				OID uint64 `json:"oid"`
-			} `json:"filled"`
-		}
-		if err := json.Unmarshal(raw, &status); err != nil {
-			return fmt.Errorf("exchange unknown status: %s", raw)
-		}
-		if status.Error != "" {
-			return fmt.Errorf("exchange: %s", status.Error)
-		}
-		if status.Resting == nil && status.Filled == nil {
-			return fmt.Errorf("exchange unconfirmed status: %s", raw)
+		switch leg.Kind {
+		case "success":
+			if !cancels {
+				return c.unknown(action, n, fmt.Errorf("exchange unexpected status for leg %d: %s", i, raw))
+			}
+			partial.Executed = append(partial.Executed, out)
+		case "resting", "filled":
+			if leg.OID == 0 {
+				return c.unknown(action, n, fmt.Errorf("exchange leg %d is %s without an order ID: %s", i, leg.Kind, raw))
+			}
+			if cancels {
+				return c.unknown(action, n, fmt.Errorf("exchange unexpected status for leg %d: %s", i, raw))
+			}
+			partial.Executed = append(partial.Executed, out)
+		case "waitingForFill", "waitingForTrigger":
+			if cancels {
+				return c.unknown(action, n, fmt.Errorf("exchange unexpected status for leg %d: %s", i, raw))
+			}
+			partial.Tracking = append(partial.Tracking, out)
+		case "error":
+			quoted, _ := json.Marshal(leg.Error)
+			if leg.Error == "" {
+				return c.unknown(action, n, fmt.Errorf("exchange leg %d has an empty error: %s", i, raw))
+			}
+			if _, final := finalRejection("err", quoted, nil); !final {
+				// The text asks the caller to query first: the leg may have effects.
+				return c.unknown(action, n, fmt.Errorf("exchange leg %d error is not final: %s", i, raw))
+			}
+			out.Error = leg.Error
+			partial.Rejected = append(partial.Rejected, out)
+		default:
+			return c.unknown(action, n, fmt.Errorf("exchange unrecognized status for leg %d: %s", i, raw))
 		}
 	}
-	return nil
+	switch {
+	case len(partial.Executed) == 0 && len(partial.Tracking) == 0:
+		body, _ := json.Marshal(map[string]any{"statuses": statuses})
+		return &ActionRejectedError{Status: "ok", Response: body}
+	case len(partial.Rejected) == 0 && len(partial.Tracking) == 0:
+		return nil
+	}
+	return partial
+}
+
+// expectedLegs reports how many statuses an accepted reply must carry for
+// action, the cloids of its order legs in request order, and whether the action
+// is a cancel. A single modify acknowledges with one status.
+func expectedLegs(action any) (count int, cloids []string, cancel bool) {
+	switch a := action.(type) {
+	case Place:
+		for _, o := range a.Orders {
+			cloids = append(cloids, o.Cloid)
+		}
+	case *Place:
+		for _, o := range a.Orders {
+			cloids = append(cloids, o.Cloid)
+		}
+	case BatchModify:
+		for _, m := range a.Modifies {
+			cloids = append(cloids, m.Order.Cloid)
+		}
+	case *BatchModify:
+		for _, m := range a.Modifies {
+			cloids = append(cloids, m.Order.Cloid)
+		}
+	case Modify:
+		return 1, []string{a.Order.Cloid}, false
+	case *Modify:
+		return 1, []string{a.Order.Cloid}, false
+	case Cancel, *Cancel, CancelByCloid, *CancelByCloid:
+		return cancelCount(action), nil, true
+	}
+	return len(cloids), cloids, false
 }
 
 func isModifyAction(action any) bool {

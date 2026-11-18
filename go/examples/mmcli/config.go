@@ -22,8 +22,10 @@ type Config struct {
 	// default) or "l2Book" (full snapshots).
 	BookStream string
 	// OrderTransport selects how the trade command submits signed actions and
-	// reconciles them: "ws" (default) = bin-ws action_json + info_json on one
-	// connection; "rest" = POST <APIGatewayURL>/exchange + POST /info, no bin-ws.
+	// reconciles them: "rest" (default) = POST <APIGatewayURL>/exchange + POST
+	// /info, no bin-ws; "ws" = bin-ws action_json + info_json on one connection.
+	// The public /bin-ws endpoint does not accept action_json (it answers 504
+	// Gateway Timeout), so "ws" only works against a gateway that does.
 	OrderTransport string
 	// GuildVault, if set, makes the trade command act for this vault. The
 	// signer must be the vault leader or the leader's authorized API wallet.
@@ -54,7 +56,7 @@ func LoadConfig() Config {
 		APIGatewayURL:  value("API_GATEWAY_URL", DefaultAPIGatewayURL),
 		Coin:           value("COIN", "BTC"),
 		BookStream:     value("BOOK_STREAM", "l2"),
-		OrderTransport: value("ORDER_TRANSPORT", OrderTransportWS),
+		OrderTransport: value("ORDER_TRANSPORT", OrderTransportREST),
 		GuildVault:     strings.ToLower(os.Getenv("GUILD_VAULT_ADDRESS")),
 		KeyFile:        value("KEY_FILE", "key"),
 		StateDir:       value("STATE_DIR", "state"),

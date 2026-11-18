@@ -4,7 +4,9 @@
 //! of `statuses[]` is inspected. Whole-action rejections, per-leg rejections
 //! and unknown outcomes are kept apart: only a reply that proves nothing
 //! executed becomes [`Error::Rejected`]; a reply that merely fails to prove a
-//! final outcome becomes [`Error::UnknownOutcome`].
+//! final outcome becomes [`Error::UnknownOutcome`]. A duplicate nonce (code
+//! 205) and `action already pending` are unknown outcomes too: the original
+//! request may have executed.
 
 use serde_json::Value;
 
@@ -172,6 +174,26 @@ fn is_ambiguous_text(text: &str) -> bool {
     AMBIGUOUS_HINTS.iter().any(|h| lower.contains(h))
 }
 
+/// Execution code of a duplicate nonce: a request with this nonce was already
+/// seen, so the original may have executed.
+const DUPLICATE_NONCE: u32 = 205;
+
+/// True for replies that say "this nonce or action was already seen".
+fn is_duplicate(text: &str) -> bool {
+    execution_code(text) == Some(DUPLICATE_NONCE) || is_ambiguous_text(text)
+}
+
+/// The one documented whole-action rejection that arrives as `status: "ok"`:
+/// a single `PrecisionExceeded` status for a multi-leg action.
+fn precision_rejection(legs: &[LegStatus], expected: usize) -> Option<&str> {
+    match legs {
+        [LegStatus::Error(message)] if expected > 1 && message.contains("PrecisionExceeded") => {
+            Some(message)
+        }
+        _ => None,
+    }
+}
+
 fn statuses_of(container: &Value) -> Option<Vec<LegStatus>> {
     let array = container.get("data")?.get("statuses")?.as_array()?;
     Some(array.iter().map(LegStatus::from_value).collect())
@@ -228,12 +250,20 @@ pub(crate) fn interpret(body: &[u8], request: &SignedRequest) -> Result<Receipt,
             if legs.iter().any(|l| matches!(l, LegStatus::Unrecognized(_))) {
                 return Err(unknown(UnknownReason::AmbiguousReceipt, legs));
             }
-            if let Some(expected) = request.expected_legs() {
+            // A single modify has no fixed leg count on success (it answers
+            // with a bare acknowledgment) but a `statuses[]` reply has one leg.
+            let expected = match request.expected_legs() {
+                Some(n) => Some(n),
+                None if request.kind() == ActionKind::Modify => Some(1),
+                None => None,
+            };
+            if let Some(expected) = expected {
                 if legs.len() != expected {
-                    // A precision error yields one status and allocates no oid
-                    // to any leg of the action.
-                    if let [LegStatus::Error(message)] = legs.as_slice() {
-                        return Err(rejected(None, message.clone(), legs));
+                    // PrecisionExceeded yields one status and allocates no oid
+                    // to any leg of the action. Any other length mismatch does
+                    // not prove that nothing executed.
+                    if let Some(message) = precision_rejection(&legs, expected) {
+                        return Err(rejected(None, message.to_string(), legs));
                     }
                     return Err(unknown(UnknownReason::AmbiguousReceipt, legs));
                 }
@@ -256,8 +286,8 @@ pub(crate) fn interpret(body: &[u8], request: &SignedRequest) -> Result<Receipt,
                     && legs
                         .iter()
                         .all(|l| matches!(l, LegStatus::Error(e) if !is_ambiguous_text(e)));
-                if all_plain_errors {
-                    let message = response.as_str().unwrap_or("action rejected").to_string();
+                let message = response.as_str().unwrap_or("action rejected").to_string();
+                if all_plain_errors && !is_duplicate(&message) {
                     return Err(rejected(execution_code(&message), message, legs));
                 }
                 return Err(unknown(UnknownReason::AmbiguousReceipt, legs));
@@ -267,11 +297,13 @@ pub(crate) fn interpret(body: &[u8], request: &SignedRequest) -> Result<Receipt,
                 Value::Null => String::new(),
                 other => other.to_string(),
             };
+            // A duplicate nonce or a pending action says the original may have
+            // executed: never a rejection, whatever else the text carries.
+            if text.is_empty() || is_duplicate(&text) {
+                return Err(unknown(UnknownReason::AmbiguousReceipt, vec![]));
+            }
             if let Some(code) = execution_code(&text) {
                 return Err(rejected(Some(code), text, vec![]));
-            }
-            if text.is_empty() || is_ambiguous_text(&text) {
-                return Err(unknown(UnknownReason::AmbiguousReceipt, vec![]));
             }
             Err(rejected(None, text, vec![]))
         }
@@ -417,6 +449,99 @@ mod tests {
         let body = br#"{"status":"err","response":"x","committedResult":{"type":"order","data":{"statuses":[{"error":"bad"},{"error":"worse"}]}}}"#;
         let e = interpret(body, &place(2)).unwrap_err();
         assert_eq!(e.as_rejected().unwrap().legs.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_nonce_and_pending_are_never_rejections() {
+        let cases: [&[u8]; 4] = [
+            br#"{"status":"err","response":"action rejected by execution (code 205): duplicate nonce"}"#,
+            br#"{"status":"err","response":"action rejected by execution (code 205)"}"#,
+            br#"{"status":"err","response":"action already pending"}"#,
+            br#"{"status":"err","response":"action rejected by execution (code 205): dup","committedResult":{"type":"order","data":{"statuses":[{"error":"bad"}]}}}"#,
+        ];
+        for body in cases {
+            let req = place(1);
+            let e = interpret(body, &req).unwrap_err();
+            assert!(
+                e.as_rejected().is_none(),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+            let u = e.as_unknown_outcome().expect("unknown outcome");
+            assert_eq!(u.nonce(), req.nonce());
+            assert_eq!(u.request.body(), req.body());
+            assert_eq!(u.reason, UnknownReason::AmbiguousReceipt);
+        }
+        // Other execution codes stay explicit rejections.
+        let body = br#"{"status":"err","response":"action rejected by execution (code 204): nonce too large"}"#;
+        assert_eq!(
+            interpret(body, &place(1))
+                .unwrap_err()
+                .as_rejected()
+                .unwrap()
+                .code,
+            Some(204)
+        );
+    }
+
+    #[test]
+    fn only_precision_exceeded_rejects_a_short_receipt() {
+        // Any other single error for a multi-leg action proves nothing.
+        let body = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"Order must have minimum value of $10."}]}}}"#;
+        let e = interpret(body, &place(2)).unwrap_err();
+        assert!(e.as_rejected().is_none());
+        assert!(e.is_unknown_outcome());
+        assert_eq!(e.as_unknown_outcome().unwrap().legs.len(), 1);
+        // Too many statuses, or a short receipt of non-errors.
+        for body in [
+            &br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":1}},{"resting":{"oid":2}},{"resting":{"oid":3}}]}}}"#[..],
+            &br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":1}}]}}}"#[..],
+            &br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"PrecisionExceeded"},{"error":"PrecisionExceeded"},{"error":"x"}]}}}"#[..],
+        ] {
+            let e = interpret(body, &place(2)).unwrap_err();
+            assert!(e.is_unknown_outcome(), "{}", String::from_utf8_lossy(body));
+        }
+        // PrecisionExceeded for a single-leg action is that leg's own result.
+        let body = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"PrecisionExceeded"}]}}}"#;
+        let r = interpret(body, &place(1)).unwrap();
+        assert_eq!(r.rejected_legs(), vec![(0, "PrecisionExceeded")]);
+        // Per-leg errors in a full-length receipt stay per-leg results.
+        let body = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"bad"},{"resting":{"oid":5}}]}}}"#;
+        let r = interpret(body, &place(2)).unwrap();
+        assert_eq!(r.rejected_legs(), vec![(0, "bad")]);
+        assert_eq!(r.oids(), vec![None, Some(5)]);
+    }
+
+    #[test]
+    fn legs_without_a_valid_oid_are_unknown_outcomes() {
+        for leg in [
+            r#"{"resting":{}}"#,
+            r#"{"resting":{"oid":"7"}}"#,
+            r#"{"resting":{"oid":-1}}"#,
+            r#"{"filled":{"totalSz":"1","avgPx":"2"}}"#,
+            r#"{"filled":{"totalSz":"1","avgPx":"2","oid":null}}"#,
+            r#"{"filled":{"oid":3}}"#,
+        ] {
+            let body = format!(
+                r#"{{"status":"ok","response":{{"type":"order","data":{{"statuses":[{leg}]}}}}}}"#
+            );
+            let e = interpret(body.as_bytes(), &place(1)).unwrap_err();
+            assert!(e.is_unknown_outcome(), "{leg}");
+            assert_eq!(e.as_unknown_outcome().unwrap().legs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_single_modify_with_statuses_needs_exactly_one() {
+        let req = request(&Modify {
+            oid: 5,
+            order: Order::limit(1, true, "1", "1", Tif::Alo),
+        });
+        let two = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"a"},{"error":"b"}]}}}"#;
+        assert!(interpret(two, &req).unwrap_err().is_unknown_outcome());
+        let one =
+            br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"a"}]}}}"#;
+        assert!(!interpret(one, &req).unwrap().all_ok());
     }
 
     #[test]

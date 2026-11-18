@@ -228,6 +228,11 @@ func (s *Session) Ping() error { return s.write(ClientFrame{Body: ClientPing}) }
 // the node's /exchange answer (the "payload" of the post reply). The bytes are
 // sent unchanged: the key order of "action" is part of the signature.
 //
+// The public RiverBit /bin-ws endpoint does not accept action_json: it
+// answers 504 Gateway Timeout. Submit orders with REST POST /exchange there;
+// this method is for gateways that do accept order entry on bin-ws. Any error
+// reply is an unknown outcome, never a rejection.
+//
 // An error does not prove the action was not executed. Preserve the request
 // and reconcile its outcome; do not resend an unknown action.
 func (s *Session) PostAction(ctx context.Context, signedRequest []byte) (json.RawMessage, error) {
