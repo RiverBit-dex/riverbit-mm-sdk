@@ -4,8 +4,8 @@ Notable changes to this repository. Each language library is versioned on its ow
 
 ## Unreleased
 
-- Repository layout, protocol guide, bin-ws Protobuf definitions and golden signing vectors.
-- Go: minimum Go version lowered to 1.24 (the lowest the dependencies allow); `/info` reads wait for `Retry-After` on 429 and otherwise use capped exponential backoff (a 429 on a signed action stays an unknown outcome); action type naming (`Place`, `Order`, `CancelItem`, `ModifyItem`) documented.
-- Python: README documents the action type naming (`Place`, `Order`, `CancelItem`, `ModifyItem`) and the shared pre-release wording and repository URL.
-- Rust: README documents the action type naming (`Place`, `Order`, `CancelItem`, `ModifyItem`) and the shared pre-release wording and repository URL.
-- Protocol guide: `/info` table lists `subAccounts`, `vaultRegistry` and `vaultDetails`. Test data README notes that fixture bytes follow the Go encoder's field order and decoders must not depend on it.
+- Protocol guide, bin-ws Protobuf definitions, golden signing vectors and bin-ws frame fixtures shared by all three libraries.
+- Go: packages `exchange` and `binws`, the `mmcli` example, and a durable pending-request journal with recovery. Requires Go 1.24 or newer.
+- Python: package `riverbit_mm` (asyncio, Python 3.10 or newer) with examples.
+- Rust: crate `riverbit-mm-sdk` (tokio, rustls) with examples.
+- All libraries send orders over REST `/exchange`, treat duplicate-nonce replies, incomplete receipts and redirects as unknown outcomes, and never resend a signed request on their own.
