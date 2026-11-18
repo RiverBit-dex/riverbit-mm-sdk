@@ -10,7 +10,7 @@ This guide covers market and account queries, signing and submitting orders, can
 | Trading | `https://pre-api.riverbit.io/exchange` | HTTP POST signed JSON |
 | Market data, events and info | `wss://pre-api.riverbit.io/bin-ws` | WebSocket binary Protobuf frames |
 
-Replace the host when switching environments. REST `/info` supports metadata, book and account queries; `/exchange` accepts signed actions. bin-ws supports `l2`, `l2Book`, `bbo`, `trades`, `candle`, account subscriptions and `info_json` queries. **Send orders, cancellations and modifications over REST `/exchange`.** The frame format defines `action_json` (the same signed request bytes as REST), but the public bin-ws endpoint does not accept it: the server replies `504 Gateway Timeout`. Treat such a reply as an unknown outcome and reconcile; do not resend. `metaAndAssetCtxs`, `userRole` and `leadingVaults` must use REST.
+Replace the host when switching environments. REST `/info` supports metadata, book and account queries; `/exchange` accepts signed actions. bin-ws supports `l2`, `l2Book`, `bbo`, `trades`, `candle`, account subscriptions and `info_json` queries. **Send orders, cancellations and modifications over REST `/exchange`.** `metaAndAssetCtxs`, `userRole` and `leadingVaults` must use REST.
 
 All `/info` queries are POST JSON with a `type` field:
 
@@ -75,7 +75,7 @@ Use millisecond timestamps in `[block time - 48 hours, block time + 24 hours]`. 
 
 ## 4. bin-ws connection and login
 
-Every binary WebSocket message is a Protobuf `WsV2ClientFrame` or `WsV2ServerFrame`; complete definitions are in Appendix A. `action_json` and `info_json` replies carry the request's nonzero outer `id`; pushes, subscription acknowledgments and pong have id 0. Use unique nonzero IDs for action/info and match replies by ID. Use a long-lived connection for login, subscriptions and orders; each new connection needs its own login and consumes connection quota.
+Every binary WebSocket message is a Protobuf `WsV2ClientFrame` or `WsV2ServerFrame`; complete definitions are in Appendix A. An `info_json` reply carries the request's nonzero outer `id`; pushes, subscription acknowledgments and pong have id 0. Use unique nonzero IDs for info requests and match replies by ID. Use a long-lived connection for login, subscriptions and queries; each new connection needs its own login and consumes connection quota.
 
 The **first frame must be `WsV2Login` within 10 seconds**. Sign these four lines with EIP-191 `personal_sign`, separated by newline with no final newline:
 
@@ -163,7 +163,7 @@ Whole-action execution errors include code 91 (unknown signer/user or bad signin
 
 REST limits are per client IP; the per-minute budget is supplied operationally. 429 returns `Retry-After`; excess in-flight requests return 503; bodies over 2 MiB return 413. `/info` weight is 2 for `l2Book`, `allMids`, `clearinghouseState`, `orderStatus`, `spotClearinghouseState`, `exchangeStatus`; 60 for `userRole`; 20 for other types. `/exchange` weight is `1 + floor(count / 40)` for `order`, `cancel`, `cancelByCloid`, `batchModify`, and 1 for `modify`. Query `userRole` only at startup due to its weight. Do not treat a generic HTTP failure as proof of rejection.
 
-bin-ws quotas per IP: 10 simultaneous connections, 30 new connections/minute, 1000 subscriptions, 10 distinct subscribed users, 2000 client messages/minute, 100 outstanding action/info requests, and 1 MiB per message. Rate excess can send an error then disconnect; excess outstanding requests receive 429; oversized messages disconnect. The server disconnects after 60 seconds with no server-to-client message. On quiet connections send a ping about every 30 seconds; pong is a JSON frame with id 0.
+bin-ws quotas per IP: 10 simultaneous connections, 30 new connections/minute, 1000 subscriptions, 10 distinct subscribed users, 2000 client messages/minute, 100 outstanding info requests, and 1 MiB per message. Rate excess can send an error then disconnect; excess outstanding requests receive 429; oversized messages disconnect. The server disconnects after 60 seconds with no server-to-client message. On quiet connections send a ping about every 30 seconds; pong is a JSON frame with id 0.
 
 After a disconnect, reconnect and log in, resubscribe and wait for acknowledgments, query open orders and rebuild local state, then process updates. **Keep unknown requests pending and reconcile; do not resend them.** Open-order snapshots do not by themselves establish request finality or a consistent account snapshot.
 
@@ -228,7 +228,7 @@ An explicit rejection without potentially effective results can end that request
 
 ### 11.5 Restart, shutdown and monitoring
 
-On restart, verify original signer, account, endpoint, network and durable directory, recover unknown requests, then rebuild orders and risk state. Changing WS/REST, account or instance must not bypass pending. Recovery only queries; it never replays an action.
+On restart, verify original signer, account, endpoint, network and durable directory, recover unknown requests, then rebuild orders and risk state. Changing account or instance must not bypass pending. Recovery only queries; it never replays an action.
 
 A continuous maker should stop new quotes, retain unknown requests, cancel known orders in its own management scope and verify outcomes before reporting cleanup complete. Exiting a process or closing WS does not cancel orders. The SDK does not cancel orders automatically on shutdown; orders you leave open need explicit cancellation. Report incomplete cleanup if cancellation or queries fail; successful process exit is not zero account exposure.
 
@@ -240,11 +240,10 @@ Use `syntax = "proto3"; package riverbit.api.v1;` with these messages to generat
 
 ```proto
 message WsV2ClientFrame {
-  // Request id for post bodies (action/info); ignored otherwise.
+  // Request id for info requests; ignored otherwise.
   uint64 id = 1;
+  reserved 2;
   oneof body {
-    // Exact signed action JSON bytes (the same body as REST POST /exchange).
-    bytes action_json = 2;
     // Info payload JSON, for example {"type":"openOrders","user":"0x..."}.
     bytes info_json = 3;
     // Subscription object JSON, for example {"type":"candle","coin":"BTC","interval":"1m"}.

@@ -7,8 +7,9 @@
 // The package covers the frames and their codec, the EIP-191 login, a Session
 // (login, subscribe, ping, requests matched by frame id), a Run loop that
 // reconnects, re-logs in and resubscribes, typed-frame routing, and a Book
-// that replays the incremental l2 stream. Signed actions are built and signed
-// by package exchange, which uses a Session as its transport.
+// that replays the incremental l2 stream. Orders, cancellations and
+// modifications are signed and submitted with REST POST /exchange by package
+// exchange; bin-ws carries market data, order and fill events and info queries.
 //
 // A market data session:
 //

@@ -43,7 +43,7 @@ func TestSessionLoginSubscribeAndMatchRepliesByID(t *testing.T) {
 
 	var mu sync.Mutex
 	var subs []string
-	actions := make(chan binws.ClientFrame, 2)
+	requests := make(chan binws.ClientFrame, 2)
 	server.Handle = func(c *binwstest.Conn, f binws.ClientFrame) {
 		switch f.Body {
 		case binws.ClientSubscribe:
@@ -51,22 +51,22 @@ func TestSessionLoginSubscribeAndMatchRepliesByID(t *testing.T) {
 			subs = append(subs, string(f.Data))
 			mu.Unlock()
 			_ = c.SendJSON(0, `{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":`+string(f.Data)+`}}`)
-		case binws.ClientAction:
-			actions <- f
-			if len(actions) < 2 {
+		case binws.ClientInfo:
+			requests <- f
+			if len(requests) < 2 {
 				return
 			}
 			// Answer both in reverse order, with a push in between: replies must
 			// still reach the request with the same outer id.
-			first, second := <-actions, <-actions // arrival order
+			first, second := <-requests, <-requests // arrival order
 			for _, req := range []binws.ClientFrame{first, second} {
 				if req.ID == 0 {
-					t.Errorf("action frame without id")
+					t.Errorf("info frame without id")
 				}
 			}
-			_ = c.SendJSON(second.ID, fmt.Sprintf(`{"channel":"post","data":{"id":%d,"response":{"type":"action","payload":{"echo":%s}}}}`, second.ID, second.Data))
+			_ = c.SendJSON(second.ID, fmt.Sprintf(`{"channel":"post","data":{"id":%d,"response":{"type":"info","payload":{"echo":%s}}}}`, second.ID, second.Data))
 			_ = c.SendJSON(0, `{"channel":"orderUpdates","data":[]}`)
-			_ = c.SendJSON(first.ID, fmt.Sprintf(`{"channel":"post","data":{"id":%d,"response":{"type":"action","payload":{"echo":%s}}}}`, first.ID, first.Data))
+			_ = c.SendJSON(first.ID, fmt.Sprintf(`{"channel":"post","data":{"id":%d,"response":{"type":"info","payload":{"echo":%s}}}}`, first.ID, first.Data))
 		}
 	}
 
@@ -116,7 +116,7 @@ func TestSessionLoginSubscribeAndMatchRepliesByID(t *testing.T) {
 		go func(body string) {
 			reqCtx, done := context.WithTimeout(ctx, 5*time.Second)
 			defer done()
-			payload, err := session.PostAction(reqCtx, []byte(body))
+			payload, err := session.PostInfo(reqCtx, []byte(body))
 			results <- result{body, string(payload), err}
 		}(body)
 	}
@@ -159,7 +159,7 @@ func TestSessionPendingRequestFailsWhenConnectionEnds(t *testing.T) {
 	sign, _ := signer(t)
 	server := binwstest.New(t, "h")
 	server.Handle = func(c *binwstest.Conn, f binws.ClientFrame) {
-		if f.Body == binws.ClientAction {
+		if f.Body == binws.ClientInfo {
 			_ = c.Close()
 		}
 	}
@@ -169,8 +169,8 @@ func TestSessionPendingRequestFailsWhenConnectionEnds(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := session.PostAction(ctx, []byte(`{}`)); err == nil || ctx.Err() != nil {
-		t.Fatalf("PostAction error = %v (ctx %v); want a connection error before the timeout", err, ctx.Err())
+	if _, err := session.PostInfo(ctx, []byte(`{}`)); err == nil || ctx.Err() != nil {
+		t.Fatalf("PostInfo error = %v (ctx %v); want a connection error before the timeout", err, ctx.Err())
 	}
 }
 

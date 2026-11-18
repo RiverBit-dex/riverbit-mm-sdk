@@ -8,25 +8,20 @@ import (
 
 // Config is read from environment variables; see LoadConfig.
 type Config struct {
-	// BinWSURL is the bin-ws endpoint used for market data, order events and
-	// trading (one long-lived connection per process).
+	// BinWSURL is the bin-ws endpoint used for market data and order events
+	// (one long-lived connection per process).
 	BinWSURL string
 	// BinWSLoginHost is signed into the login message ("host:" line). It must
 	// equal the server's configured public host.
 	BinWSLoginHost string
-	// APIGatewayURL is the HTTP base; queries POST to <base>/info.
+	// APIGatewayURL is the HTTP base; orders POST to <base>/exchange and
+	// queries POST to <base>/info.
 	APIGatewayURL string
 	// Coin is the market the example watches and trades, for example "BTC".
 	Coin string
 	// BookStream selects the order book subscription: "l2" (incremental, the
 	// default) or "l2Book" (full snapshots).
 	BookStream string
-	// OrderTransport selects how the trade command submits signed actions and
-	// reconciles them: "rest" (default) = POST <APIGatewayURL>/exchange + POST
-	// /info, no bin-ws; "ws" = bin-ws action_json + info_json on one connection.
-	// The public /bin-ws endpoint does not accept action_json (it answers 504
-	// Gateway Timeout), so "ws" only works against a gateway that does.
-	OrderTransport string
 	// GuildVault, if set, makes the trade command act for this vault. The
 	// signer must be the vault leader or the leader's authorized API wallet.
 	GuildVault string
@@ -38,14 +33,11 @@ type Config struct {
 	SignChainID string
 }
 
-// Defaults and the values of Config.OrderTransport.
+// Defaults.
 const (
 	DefaultBinWSURL       = "wss://pre-api.riverbit.io/bin-ws"
 	DefaultBinWSLoginHost = "pre-api.riverbit.io"
 	DefaultAPIGatewayURL  = "https://pre-api.riverbit.io"
-
-	OrderTransportWS   = "ws"
-	OrderTransportREST = "rest"
 )
 
 // LoadConfig reads the example's settings from environment variables.
@@ -56,7 +48,6 @@ func LoadConfig() Config {
 		APIGatewayURL:  value("API_GATEWAY_URL", DefaultAPIGatewayURL),
 		Coin:           value("COIN", "BTC"),
 		BookStream:     value("BOOK_STREAM", "l2"),
-		OrderTransport: value("ORDER_TRANSPORT", OrderTransportREST),
 		GuildVault:     strings.ToLower(os.Getenv("GUILD_VAULT_ADDRESS")),
 		KeyFile:        value("KEY_FILE", "key"),
 		StateDir:       value("STATE_DIR", "state"),
@@ -69,9 +60,6 @@ func LoadConfig() Config {
 func (c Config) Validate() error {
 	if c.BookStream != "l2" && c.BookStream != "l2Book" {
 		return fmt.Errorf("BOOK_STREAM must be l2 or l2Book, got %q", c.BookStream)
-	}
-	if c.OrderTransport != OrderTransportWS && c.OrderTransport != OrderTransportREST {
-		return fmt.Errorf("ORDER_TRANSPORT must be ws or rest, got %q", c.OrderTransport)
 	}
 	if c.BinWSLoginHost == "" {
 		return fmt.Errorf("BIN_WS_LOGIN_HOST is empty")

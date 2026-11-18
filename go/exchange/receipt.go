@@ -50,8 +50,7 @@ func (r *Receipt) Rejected() []LegStatus {
 	return out
 }
 
-// ParseReceipt parses an /exchange reply, as returned by REST or as the
-// payload of a bin-ws action reply.
+// ParseReceipt parses an /exchange reply.
 func ParseReceipt(raw []byte) (*Receipt, error) {
 	var reply struct {
 		Status          string          `json:"status"`

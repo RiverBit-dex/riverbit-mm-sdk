@@ -16,7 +16,6 @@ from . import _proto as pb
 from .errors import ProtocolError
 
 # oneof field numbers of WsV2ClientFrame
-CLIENT_ACTION = 2
 CLIENT_INFO = 3
 CLIENT_SUBSCRIBE = 4
 CLIENT_UNSUBSCRIBE = 5
@@ -60,7 +59,7 @@ class ClientFrame:
 
 def decode_client_frame(data: bytes) -> ClientFrame:
     msg = pb.Message(data)
-    found = [n for n in range(CLIENT_ACTION, CLIENT_LOGIN + 1) if msg.has(n)]
+    found = [n for n in range(CLIENT_INFO, CLIENT_LOGIN + 1) if msg.has(n)]
     if not found:
         raise ProtocolError("client frame has no body")
     if len(found) > 1:

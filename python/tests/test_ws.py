@@ -10,24 +10,19 @@ from typing import Any
 import pytest
 
 from riverbit_mm import (
-    ActionRejected,
     BinWsSession,
     Book,
     Connected,
     Disconnected,
     ExchangeClient,
     LoginFailed,
-    NonceSource,
-    NotSent,
     Order,
     Place,
     PostError,
     ProtocolError,
-    RequestTimeout,
     ServerFrame,
     SessionClosed,
     Signer,
-    UnknownOutcome,
     subscriptions,
 )
 from riverbit_mm import frames as fr
@@ -37,6 +32,7 @@ from .mock_ws import MockBinWs, MockConn
 
 HOST = "api.example.test"
 MASTER = "0x" + "22" * 20
+ORDER = Order(0, True, "100.5", "0.2", cloid="0x" + "00" * 15 + "01")
 
 
 def make_session(server: MockBinWs, signer: Signer, **kw: Any) -> BinWsSession:
@@ -218,129 +214,6 @@ async def test_info_error_reply_and_mismatched_payload(test_signer: Signer) -> N
                 await session.query({"type": "meta"})
 
 
-def exchange_ws(session: BinWsSession, signer: Signer, **kw: Any) -> ExchangeClient:
-    return ExchangeClient(
-        "https://unused.example.test",
-        signer,
-        chain_id=12589,
-        nonce_source=NonceSource(clock_ms=lambda: 1_792_168_694_973),
-        ws=session,
-        **kw,
-    )
-
-
-ORDER = Order(0, True, "100.5", "0.2", cloid="0x" + "00" * 15 + "01")
-
-
-async def test_action_json_carries_the_signed_bytes(test_signer: Signer) -> None:
-    async with MockBinWs(HOST) as server:
-
-        async def handler(conn: MockConn, frame: fr.ClientFrame) -> None:
-            reply = {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 42}}]}}}
-            await conn.post_reply(frame.id, "action", reply)
-
-        server.handler = handler
-        async with make_session(server, test_signer) as session:
-            client = exchange_ws(session, test_signer)
-            request = client.sign(Place([ORDER]))
-            receipt = await client.submit(request)
-        frame = server.frames_of(fr.CLIENT_ACTION)[0]
-        assert frame.data == request.body and frame.id != 0
-        assert receipt.all_ok and receipt.oids == (42,)
-
-
-async def test_rejection_over_bin_ws(test_signer: Signer) -> None:
-    async with MockBinWs(HOST) as server:
-
-        async def handler(conn: MockConn, frame: fr.ClientFrame) -> None:
-            await conn.post_reply(
-                frame.id,
-                "action",
-                {"status": "err", "response": "action rejected by execution (code 1160)"},
-            )
-
-        server.handler = handler
-        async with make_session(server, test_signer) as session:
-            with pytest.raises(ActionRejected) as err:
-                await exchange_ws(session, test_signer).place([ORDER])
-        assert err.value.code == 1160
-
-
-async def test_unanswered_action_is_an_unknown_outcome(test_signer: Signer) -> None:
-    async with MockBinWs(HOST) as server, make_session(server, test_signer) as session:
-        client = exchange_ws(session, test_signer, timeout=0.05)
-        request = client.sign(Place([ORDER]))
-        with pytest.raises(UnknownOutcome) as err:
-            await client.submit(request)
-        assert isinstance(err.value.cause, RequestTimeout)
-        assert err.value.request_body == request.body and err.value.transport == "bin-ws"
-
-
-async def test_error_reply_to_an_action_is_an_unknown_outcome(test_signer: Signer) -> None:
-    async with MockBinWs(HOST) as server:
-
-        async def handler(conn: MockConn, frame: fr.ClientFrame) -> None:
-            await conn.post_reply(frame.id, "error", "429 Too Many Requests")
-
-        server.handler = handler
-        async with make_session(server, test_signer) as session:
-            with pytest.raises(UnknownOutcome) as err:
-                await exchange_ws(session, test_signer).place([ORDER])
-        assert isinstance(err.value.cause, PostError)
-
-
-@pytest.mark.parametrize("variant", ["wrong_type", "inner_id", "no_response", "not_post"])
-async def test_malformed_action_reply_is_an_unknown_outcome(
-    test_signer: Signer, variant: str
-) -> None:
-    async with MockBinWs(HOST) as server:
-
-        async def handler(conn: MockConn, frame: fr.ClientFrame) -> None:
-            if variant == "wrong_type":
-                await conn.post_reply(frame.id, "info", {"type": "meta", "data": {}})
-            elif variant == "inner_id":
-                bad = {"channel": "post", "data": {"id": frame.id + 5, "response": {}}}
-                await conn.send_json(frame.id, bad)
-            elif variant == "no_response":
-                await conn.send_json(frame.id, {"channel": "post", "data": {"id": frame.id}})
-            else:
-                await conn.send_json(frame.id, {"channel": "other", "data": {}})
-
-        server.handler = handler
-        async with make_session(server, test_signer) as session:
-            client = exchange_ws(session, test_signer)
-            request = client.sign(Place([ORDER]))
-            with pytest.raises(UnknownOutcome) as err:
-                await client.submit(request)
-        assert isinstance(err.value.cause, ProtocolError)
-        assert err.value.request is request and err.value.transport == "bin-ws"
-
-
-async def test_disconnect_while_waiting_is_an_unknown_outcome(test_signer: Signer) -> None:
-    async with MockBinWs(HOST) as server:
-
-        async def handler(conn: MockConn, frame: fr.ClientFrame) -> None:
-            await conn.drop()
-
-        server.handler = handler
-        async with make_session(server, test_signer, reconnect=False) as session:
-            with pytest.raises(UnknownOutcome) as err:
-                await exchange_ws(session, test_signer).place([ORDER])
-        assert isinstance(err.value.cause, SessionClosed)
-        assert err.value.nonce == 1_792_168_694_973
-
-
-async def test_not_connected_means_not_sent(test_signer: Signer) -> None:
-    async with MockBinWs(HOST) as server:
-        session = make_session(server, test_signer)  # never started
-        client = exchange_ws(session, test_signer)
-        request = client.sign(Place([ORDER]))
-        with pytest.raises(NotSent) as err:
-            await client.submit(request)
-        assert err.value.request is request
-        assert server.received == []
-
-
 async def test_reconnect_logs_in_again_and_resubscribes(test_signer: Signer) -> None:
     async with MockBinWs(HOST) as server, make_session(server, test_signer) as session:
         items = session.frames()
@@ -363,20 +236,6 @@ async def test_reconnect_logs_in_again_and_resubscribes(test_signer: Signer) -> 
         resent = server.frames_of(fr.CLIENT_SUBSCRIBE)[2]
         assert resent.data == b'{"type":"l2","c":"BTC"}'  # only the live subscription
         assert session.connected
-
-
-async def test_post_during_reconnect_is_refused_without_sending(test_signer: Signer) -> None:
-    async with MockBinWs(HOST) as server:
-        session = make_session(server, test_signer, backoff_initial=5.0, backoff_max=5.0)
-        async with session:
-            items = session.frames()
-            await next_item(items)
-            await server.connections[0].drop()
-            assert isinstance(await next_item(items), Disconnected)
-            assert not session.connected
-            client = exchange_ws(session, test_signer)
-            with pytest.raises(NotSent):
-                await client.place([ORDER])
 
 
 async def test_reconnect_login_rejection_is_fatal(test_signer: Signer) -> None:

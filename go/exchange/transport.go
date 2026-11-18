@@ -11,20 +11,6 @@ import (
 	"github.com/riverbit-dex/riverbit-mm-sdk/go/binws"
 )
 
-// ActionTransport submits signed /exchange request bodies over a long-lived
-// connection. *binws.Session implements it: the body goes out as action_json
-// with an incrementing frame id and the reply is matched by that id.
-//
-// The public RiverBit /bin-ws endpoint does not accept action_json (it answers
-// 504 Gateway Timeout); order entry there is REST POST /exchange only. Any error
-// from PostAction, including an error reply, is an unknown outcome.
-type ActionTransport interface {
-	// URL identifies the transport in durable request journals.
-	URL() string
-	// PostAction returns the node's /exchange answer for one signed request.
-	PostAction(ctx context.Context, signedRequest []byte) (json.RawMessage, error)
-}
-
 // InfoTransport sends info queries over a long-lived connection.
 // *binws.Session implements it with info_json; the reply payload is
 // {"type":<query type>,"data":<the HTTP /info answer>}.
@@ -32,31 +18,13 @@ type InfoTransport interface {
 	PostInfo(ctx context.Context, request []byte) (json.RawMessage, error)
 }
 
-var (
-	_ ActionTransport = (*binws.Session)(nil)
-	_ InfoTransport   = (*binws.Session)(nil)
-)
+var _ InfoTransport = (*binws.Session)(nil)
 
-// exchangeTimeout bounds one submission on either transport. Running out of
+// exchangeTimeout bounds one submission. Running out of
 // time leaves the outcome unknown: the caller reconciles, it never resends.
 const exchangeTimeout = 20 * time.Second
 
-// postBinary sends the signed request body over bin-ws
-// (WsV2ClientFrame.action_json), byte for byte as produced by submit.
-func (c *Client) postBinary(ctx context.Context, body []byte, out any) error {
-	ctx, cancel := context.WithTimeout(ctx, exchangeTimeout)
-	defer cancel()
-	payload, err := c.WS.PostAction(ctx, body)
-	if err != nil {
-		return fmt.Errorf("bin-ws action: %w", err)
-	}
-	if err = json.Unmarshal(payload, out); err != nil {
-		return fmt.Errorf("invalid exchange response: %w", err)
-	}
-	return nil
-}
-
-// postREST POSTs the same signed request body to <URL>/exchange. A non-200
+// postREST POSTs the signed request body to <URL>/exchange. A non-200
 // status or a timeout is returned as an error, which the caller treats as an
 // unknown outcome (reconcile via orderStatus, no resend).
 func (c *Client) postREST(ctx context.Context, body []byte, out any) error {

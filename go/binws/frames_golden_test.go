@@ -97,8 +97,6 @@ func orEmpty32(v []uint32) []uint32 {
 func describeClient(f ClientFrame) (obj, error) {
 	o := obj{{"id", f.ID}}
 	switch f.Body {
-	case ClientAction:
-		return append(o, kv{"body", "action_json"}, kv{"json", string(f.Data)}), nil
 	case ClientInfo:
 		return append(o, kv{"body", "info_json"}, kv{"json", string(f.Data)}), nil
 	case ClientSubscribe:

@@ -115,7 +115,7 @@ func alo(price string) Order {
 	return Order{Asset: 0, Buy: true, Price: price, Size: "0.10", Type: OrderType{Limit: Limit{TIF: "Alo"}}}
 }
 
-// REST mode: the signed request is POSTed to /exchange (no bin-ws at all) and
+// The signed request is POSTed to /exchange (no bin-ws at all) and
 // the placed order is confirmed by orderStatus over HTTP /info.
 func TestPlaceOverRESTReconcilesWithOrderStatus(t *testing.T) {
 	client := restVaultClient(t)
@@ -205,62 +205,19 @@ func TestRESTUnknownOutcomeReconcilesWithoutResend(t *testing.T) {
 	}
 }
 
-// The REST body and the bin-ws action_json are the same bytes for the same
-// signed request.
-func TestRESTAndBinWSSendIdenticalBytes(t *testing.T) {
-	client := restVaultClient(t)
-	client.StateDir = "" // This test exercises wire serialization, not durable recovery.
-	action := &Cancel{Type: "cancel", Cancels: []CancelItem{{Asset: 0, OID: 7}}}
-	const nonce = 1760000000123
-	sig, err := client.Sign(action, nonce)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const okCancel = `{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}`
-
-	rest := newFakeREST(t, testVault)
-	rest.exchange = func(w http.ResponseWriter, _ *http.Request, _ []byte) { fmt.Fprint(w, okCancel) }
-	client.URL = rest.URL
-	if err := client.submit(context.Background(), action, nonce, sig); err != nil {
-		t.Fatal(err)
-	}
-
-	var wsMu sync.Mutex
-	var wsBody []byte
-	server := binwstest.New(t, "h")
-	server.Handle = func(c *binwstest.Conn, f binws.ClientFrame) {
-		wsMu.Lock()
-		wsBody = append([]byte(nil), f.Data...)
-		wsMu.Unlock()
-		_ = c.SendJSON(f.ID, fmt.Sprintf(`{"channel":"post","data":{"id":%d,"response":{"type":"action","payload":%s}}}`, f.ID, okCancel))
-	}
-	session, err := binws.Dial(context.Background(), binws.Config{URL: server.URL(), LoginHost: "h", Sign: client.Signer()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
-	client.WS = session
-	if err := client.submit(context.Background(), action, nonce, sig); err != nil {
-		t.Fatal(err)
-	}
-	restBody := rest.exchangeBodies()[0]
-	wsMu.Lock()
-	defer wsMu.Unlock()
-	if !bytes.Equal(restBody, wsBody) {
-		t.Fatalf("REST body differs from action_json:\nREST %s\n ws  %s", restBody, wsBody)
-	}
-	if keys, _ := topLevelKeys(restBody); strings.Join(keys, ",") != "action,nonce,signature,vaultAddress" {
-		t.Fatalf("keys = %v", keys)
-	}
-}
-
-// ws mode: the action goes out as action_json and orderStatus / openOrders go
-// out as info_json on the same connection, matched by id. HTTP is not used.
+// The action goes out over REST POST /exchange; orderStatus / openOrders go
+// out as info_json on a bin-ws connection (Client.Queries), matched by id.
+// REST /info is not used.
 func TestBinWSReconciliationUsesInfoJSON(t *testing.T) {
 	client := restVaultClient(t)
 	verifier := &fakeExchange{t: t, canceled: map[string]bool{}}
 	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("ws mode reconciliation must not use HTTP, got %s", r.URL.Path)
+		if r.URL.Path != "/exchange" {
+			t.Errorf("reconciliation over bin-ws must not use REST %s", r.URL.Path)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		fmt.Fprint(w, verifier.verify(client, body))
 	}))
 	defer gateway.Close()
 	client.URL = gateway.URL
@@ -274,9 +231,6 @@ func TestBinWSReconciliationUsesInfoJSON(t *testing.T) {
 		ids = append(ids, f.ID)
 		mu.Unlock()
 		switch f.Body {
-		case binws.ClientAction:
-			payload := verifier.verify(client, f.Data)
-			_ = c.SendJSON(f.ID, fmt.Sprintf(`{"channel":"post","data":{"id":%d,"response":{"type":"action","payload":%s}}}`, f.ID, payload))
 		case binws.ClientInfo:
 			var q struct {
 				Type string `json:"type"`
@@ -305,7 +259,7 @@ func TestBinWSReconciliationUsesInfoJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close()
-	client.WS, client.Queries = session, session
+	client.Queries = session
 
 	if err := client.Exchange(ctx, &Place{Type: "order", Orders: []Order{alo("100.0000")}, Grouping: "na"}); err != nil {
 		t.Fatal(err)

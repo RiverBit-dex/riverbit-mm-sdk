@@ -72,8 +72,7 @@ class UnknownOutcome(RiverBitError):
     """The action may or may not have executed.
 
     Raised on a timeout, a disconnect, a non-200 answer, a malformed or incomplete
-    reply (including one whose statuses do not match the legs sent, or any bin-ws
-    reply that cannot be read after the request was written), a duplicate nonce
+    reply (including one whose statuses do not match the legs sent), a duplicate nonce
     (code 205: the first request with that nonce may have executed), or a reply
     that asks the caller to query before deciding.
 
@@ -103,20 +102,6 @@ class UnknownOutcome(RiverBitError):
         super().__init__(f"outcome unknown (nonce {request.nonce}, {transport}): {reason}")
 
 
-class NotSent(RiverBitError):
-    """The request was never written to the socket; nothing can have executed.
-
-    Only raised when the bin-ws session was not connected at submission time.
-    The same :class:`~riverbit_mm.SignedRequest` may be submitted again; the
-    nonce was not consumed.
-    """
-
-    def __init__(self, reason: str, *, request: SignedRequest) -> None:
-        self.request = request
-        self.nonce = request.nonce
-        super().__init__(f"request not sent (nonce {request.nonce}): {reason}")
-
-
 class ProtocolError(RiverBitError):
     """A frame or payload did not match the documented format."""
 
@@ -141,7 +126,7 @@ class RequestTimeout(RiverBitError):
 
 
 class PostError(RiverBitError):
-    """A bin-ws ``action_json`` / ``info_json`` request got an ``error`` reply."""
+    """A bin-ws ``info_json`` request got an ``error`` reply."""
 
     def __init__(self, request_id: int, payload: str) -> None:
         self.request_id = request_id

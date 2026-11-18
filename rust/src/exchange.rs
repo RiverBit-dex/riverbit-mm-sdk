@@ -1,6 +1,5 @@
 //! The exchange client: sign, send, parse the receipt.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::actions::Action;
@@ -8,20 +7,16 @@ use crate::error::{Error, Result, UnknownOutcome, UnknownReason};
 use crate::nonce::NonceSource;
 use crate::receipt::{interpret, Receipt};
 use crate::signing::{ActionInfo, Address, SignedRequest, Signer, SigningDomain};
-use crate::transport::{ActionTransport, Rest, RestActions, TransportError};
+use crate::transport::{Rest, RestActions, TransportError};
 
-/// Signs trading actions and submits them over REST (default).
-///
-/// Send orders over REST: the public bin-ws endpoint does not accept
-/// `action_json`. A [`BinWsSession`](crate::BinWsSession) can still be used as
-/// the transport for an endpoint that does.
+/// Signs trading actions and submits them with REST `POST /exchange`.
 ///
 /// A request is signed once. The bytes of the [`SignedRequest`] are the bytes
-/// that go on the wire, on either transport. If a send ends without a usable
+/// that go on the wire. If a send ends without a usable
 /// reply the result is [`Error::UnknownOutcome`] carrying that request; the
 /// client never signs a replacement with a new nonce.
 pub struct ExchangeClient {
-    transport: Arc<dyn ActionTransport>,
+    transport: RestActions,
     signer: Signer,
     domain: SigningDomain,
     vault: Option<Address>,
@@ -47,30 +42,19 @@ impl ExchangeClient {
     ) -> Result<Self> {
         // The per-request HTTP timeout is only a backstop: `with_timeout`
         // bounds the whole submission.
-        let transport = Arc::new(RestActions {
+        let transport = RestActions {
             rest: Rest::new(base_url, http)?,
             timeout: Duration::from_secs(300),
-        });
-        Ok(Self::with_transport(transport, signer, domain))
-    }
-
-    /// A client over any [`ActionTransport`]. A
-    /// [`BinWsSession`](crate::BinWsSession) works only against an endpoint
-    /// that accepts `action_json`; the public `/bin-ws` endpoint does not.
-    pub fn with_transport(
-        transport: Arc<dyn ActionTransport>,
-        signer: Signer,
-        domain: SigningDomain,
-    ) -> Self {
+        };
         let nonces = NonceSource::for_signer(&signer.address());
-        ExchangeClient {
+        Ok(ExchangeClient {
             transport,
             signer,
             domain,
             vault: None,
             nonces,
             timeout: Duration::from_secs(20),
-        }
+        })
     }
 
     /// Trades for a vault: requests carry `vaultAddress` and the
@@ -89,9 +73,7 @@ impl ExchangeClient {
     }
 
     /// Bounds one submission. Running out of time is an unknown outcome, even
-    /// if the request was never written: only a transport's own, shorter
-    /// timeout (see `BinWsConfig::request_timeout`) can prove that, and then
-    /// the error is [`Error::NotSent`].
+    /// if the request was never written.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -148,10 +130,6 @@ impl ExchangeClient {
                 TransportError::Timeout => unknown(UnknownReason::Timeout, None),
                 TransportError::Disconnected(m) => unknown(UnknownReason::Disconnected(m), None),
                 TransportError::SendFailed(m) => unknown(UnknownReason::SendFailed(m), None),
-                TransportError::NotSent(reason) => Error::NotSent {
-                    request: Box::new(request.clone()),
-                    reason,
-                },
                 TransportError::Status {
                     status: 429,
                     body,
@@ -160,13 +138,9 @@ impl ExchangeClient {
                 TransportError::Status { status, body, .. } => {
                     unknown(UnknownReason::HttpStatus(status), Some(body))
                 }
-                TransportError::ErrorReply(text) if text.contains("429") => {
-                    unknown(UnknownReason::RateLimited { retry_after: None }, Some(text))
+                TransportError::ErrorReply(m) | TransportError::Other(m) => {
+                    unknown(UnknownReason::SendFailed(m), None)
                 }
-                TransportError::ErrorReply(text) => {
-                    unknown(UnknownReason::ErrorReply(text.clone()), Some(text))
-                }
-                TransportError::Other(m) => unknown(UnknownReason::SendFailed(m), None),
             }),
         }
     }

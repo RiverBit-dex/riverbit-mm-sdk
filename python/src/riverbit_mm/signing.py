@@ -66,8 +66,8 @@ class Signature:
 class SignedRequest:
     """A fully signed ``/exchange`` request.
 
-    ``body`` is the exact byte string to POST to ``/exchange`` or to send as
-    ``action_json``. Never rebuild it from ``action_json``: send these bytes.
+    ``body`` is the exact byte string to POST to ``/exchange``. Never rebuild it
+    from ``action_json``: send these bytes.
 
     ``repr`` and ``str`` are deliberately short: they show the nonce, the action
     type and the signer address, but neither the signature nor the signed body, so

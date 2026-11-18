@@ -252,7 +252,7 @@ pub struct ActionInfo {
 }
 
 /// An action that has been signed and serialized: the request body, ready to
-/// send as the body of `POST /exchange` or as `action_json`.
+/// send as the body of `POST /exchange`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SignedRequest {
     body: Vec<u8>,
@@ -459,10 +459,6 @@ mod tests {
             reply: None,
         };
         let error = Error::UnknownOutcome(Box::new(unknown.clone()));
-        let not_sent = Error::NotSent {
-            request: Box::new(request.clone()),
-            reason: "queued".into(),
-        };
         let login = signer.sign_login("host.example", 1, [7; 16]).unwrap();
         let outputs = [
             format!("{request:?}"),
@@ -470,8 +466,6 @@ mod tests {
             format!("{unknown:?}"),
             format!("{error:?}"),
             format!("{error}"),
-            format!("{not_sent:?}"),
-            format!("{not_sent}"),
             format!("{signer:?}"),
             format!("{signature:?}"),
             format!("{login:?}"),

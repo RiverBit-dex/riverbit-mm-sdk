@@ -1,6 +1,6 @@
 # riverbit-mm-sdk (Python)
 
-Python client library for market makers integrating with the RiverBit exchange API: signing, order entry, cancellation and modification, market data over the binary WebSocket (`bin-ws`), and reconciliation of requests whose outcome is unknown.
+Python client library for market makers integrating with the RiverBit exchange API: signing, order entry, cancellation and modification over REST (`POST /exchange`), market data and order and fill events over the binary WebSocket (`bin-ws`), and reconciliation of requests whose outcome is unknown.
 
 > **Status: pre-release.** Interfaces may change before `v0.1.0`. The SDK contains no quoting strategy: it gives you the protocol, signing and reconciliation building blocks to run your own. Read the [protocol guide](../docs/api-guide.md) before you trade.
 
@@ -84,7 +84,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`ExchangeClient` fetches `nextAgentChainId` from `chainIdentity` once, allocates nonces, signs, sends the bytes it signed with `POST /exchange` and parses the receipt. **Send orders over REST**: the public `/bin-ws` endpoint does not accept `action_json` (the server replies `504 Gateway Timeout`), so do not pass `ws=` to `ExchangeClient` there. bin-ws is for market data, order and fill events and `info_json` queries. To stream market data and keep a local book:
+`ExchangeClient` fetches `nextAgentChainId` from `chainIdentity` once, allocates nonces, signs, sends the bytes it signed with `POST /exchange` and parses the receipt. Orders, cancellations and modifications are submitted with REST `POST /exchange`; bin-ws carries market data, order and fill events and `info_json` queries. To stream market data and keep a local book:
 
 ```python
 from riverbit_mm import BinWsSession, Book, Connected, ServerFrame, subscriptions
@@ -122,8 +122,7 @@ The examples read the key from the file named by `RIVERBIT_KEY_FILE` and the end
 | Actions: `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`, `Cloid` | Yes | Fixed field order; prices and sizes must be decimal strings |
 | REST `/info` client | Yes | `chainIdentity`, `userRole`, `leadingVaults`, `metaAndAssetCtxs`, `l2Book`, `openOrders`, `frontendOpenOrders`, `orderStatus`, `userFills`, `clearinghouseState`, `candleSnapshot`, plus `query()` for any other type; `Retry-After` honoured on 429 |
 | REST `/exchange` client | Yes | Per-leg receipts; rejection, rate limit and unknown outcome are distinct |
-| bin-ws session | Yes | Login as the first frame, subscribe/unsubscribe, ping, id-matched `info_json` (and `action_json`, see below), reconnect with login and resubscribe |
-| Order entry over bin-ws (`ExchangeClient(ws=...)`) | **Not on the public endpoint** | The public `/bin-ws` does not accept `action_json` (it answers `504 Gateway Timeout`). Order entry is REST `POST /exchange` only; the option is kept for endpoints that accept actions |
+| bin-ws session | Yes | Login as the first frame, subscribe/unsubscribe, ping, id-matched `info_json` queries, reconnect with login and resubscribe |
 | Typed frames | Yes | `l2` (snapshot and update), `l2Book`, `bbo`, `trades`, `candle`; every other stream, and the JSON fallback of typed streams, as `JsonFrame` |
 | Local order book | Yes | Replays `l2` snapshots and updates (typed and JSON fallback) per guide section 5 |
 | Nonce source | Yes | Millisecond timestamps, strictly increasing under concurrency, shared per signer in a process |
@@ -140,7 +139,7 @@ Everything below is importable from `riverbit_mm`.
 **Signing** (`riverbit_mm.signing`)
 
 - `Signer(private_key)`: `address`, `address_lower`, `sign_action(action_json, nonce, chain_id=..., vault_address=None) -> SignedRequest`, `sign_login(host, timestamp_ms, nonce=None)`.
-- `SignedRequest`: `body` (the exact bytes to POST or send as `action_json`), `action_json`, `nonce`, `signature`, `vault_address`, `connection_id`, `digest`. The request body is assembled around the very bytes the signature was computed from; nothing is serialised twice.
+- `SignedRequest`: `body` (the exact bytes to `POST` to `/exchange`), `action_json`, `nonce`, `signature`, `vault_address`, `connection_id`, `digest`. The request body is assembled around the very bytes the signature was computed from; nothing is serialised twice.
 
 **Actions** (`riverbit_mm.actions`): `Order`, `Place` (the `order` action), `Cancel` / `CancelItem`, `CancelByCloid` / `CancelByCloidItem`, `Modify`, `BatchModify` / `ModifyItem`, `Cloid`. Each action has `to_json() -> bytes`. `Place` is the `order` action and `Order` is one order leg; `CancelItem`, `CancelByCloidItem` and `ModifyItem` are the legs of `cancel`, `cancelByCloid` and `batchModify`. Wrap legs in the action: `Place` takes `Order`s, `Cancel` takes `CancelItem`s, `CancelByCloid` takes `CancelByCloidItem`s, `BatchModify` takes `ModifyItem`s; `Modify` takes one oid and one `Order`.
 
@@ -151,8 +150,8 @@ Place([Order(asset=1, is_buy=True, price="80000", size="0.001", tif="Alo", cloid
 **Clients**
 
 - `InfoClient(base_url)`: one coroutine per query type, `assets()` (parsed `universe`), `next_agent_chain_id()`, and `query(body)` for anything else.
-- `ExchangeClient(base_url, signer, chain_id=None, vault_address=None, ws=None)`: `post(action)` (sign with a fresh nonce and send once), `prepare(action)` / `sign(action)` (sign only, so you can persist the request first), `submit(signed_request)`, and shortcuts `place`, `cancel`, `cancel_by_cloid`, `modify`, `batch_modify`. Actions go out with `POST /exchange`. `ws=session` sends them as `action_json` over bin-ws with identical bytes, but the public `/bin-ws` endpoint rejects `action_json` (`504 Gateway Timeout`): use REST for orders.
-- `BinWsSession(url, login_host, signer)`: `start()` / `close()` (or `async with`), `subscribe` / `unsubscribe` (recorded and re-sent after a reconnect), `ping`, `post_action`, `post_info`, `query` (unwraps `data`, retries a 429 reply), `frames()` (async iterator), `user`, `signer_address`.
+- `ExchangeClient(base_url, signer, chain_id=None, vault_address=None)`: `post(action)` (sign with a fresh nonce and send once), `prepare(action)` / `sign(action)` (sign only, so you can persist the request first), `submit(signed_request)`, and shortcuts `place`, `cancel`, `cancel_by_cloid`, `modify`, `batch_modify`. Actions go out with `POST /exchange`.
+- `BinWsSession(url, login_host, signer)`: `start()` / `close()` (or `async with`), `subscribe` / `unsubscribe` (recorded and re-sent after a reconnect), `ping`, `post_info`, `query` (unwraps `data`, retries a 429 reply), `frames()` (async iterator), `user`, `signer_address`.
 - `riverbit_mm.subscriptions`: builders for `l2`, `l2_book`, `bbo`, `trades`, `candle`, `order_updates`, `user_fills`, `open_orders`, `clearinghouse_state`.
 
 **Frames and book**
@@ -170,7 +169,6 @@ Place([Order(asset=1, is_buy=True, price="80000", size="0.001", tif="Alo", cloid
 | `ActionRejected` | The node rejected the whole action (`.code`, for example 91, 1160, 203, 204, 97). Nothing executed. | Fix the cause, then build a **new** action. The nonce is spent. |
 | `RateLimited` | A read was throttled and the retries ran out (`.retry_after`). | Back off. Read clients already retry after `Retry-After`. |
 | `UnknownOutcome` | A write may or may not have executed: timeout, disconnect, non-200 (including 429 and 5xx), malformed or incomplete reply (statuses that do not match the legs sent, a leg without its oid), a duplicate nonce (code 205: the first request with that nonce may have executed), or a reply that asks you to query first (`action already pending`, `localCommitted`, ...). Carries `.nonce`, `.request` and `.request_body`. | **Never re-sign it under a new nonce.** Reconcile with `reconcile_unknown` / `wait_reconciled`, and hold conflicting writes until it resolves. |
-| `NotSent` | The bin-ws session was not connected, so nothing was written. | The same `SignedRequest` may be submitted again. |
 
 A 429 on a write is deliberately reported as `UnknownOutcome`, not `RateLimited`: an HTTP status alone does not prove non-execution, and the SDK never retries a write.
 

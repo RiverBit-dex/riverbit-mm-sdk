@@ -16,8 +16,7 @@ import (
 // next attempt.
 //
 // Run returns nil when ctx is canceled. Pending requests on the ended session
-// fail with ErrClosed; a signed action whose reply was lost is an unknown
-// outcome, to be reconciled by package exchange, never resent.
+// fail with ErrClosed.
 func Run(ctx context.Context, newConfig func() Config, setup func(*Session) error, onEnd func(err error, retryIn time.Duration)) error {
 	backoff := time.Second
 	for ctx.Err() == nil {

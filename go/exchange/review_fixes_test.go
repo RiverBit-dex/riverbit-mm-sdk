@@ -12,9 +12,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/riverbit-dex/riverbit-mm-sdk/go/binws"
-	"github.com/riverbit-dex/riverbit-mm-sdk/go/binws/binwstest"
 )
 
 const reusedCloid = "0x11111111111111111111111111111111"
@@ -429,35 +426,5 @@ func TestSigningRefusesUnorderedActions(t *testing.T) {
 		if err := client.Exchange(context.Background(), raw); !errors.Is(err, errUnsupportedAction) || sent.Load() != 0 {
 			t.Fatalf("Exchange(json.RawMessage) = %v, sent=%d", err, sent.Load())
 		}
-	}
-}
-
-// Finding: order entry over bin-ws is not available on the public endpoint;
-// whatever the endpoint answers to an action is an unknown outcome.
-func TestBinWSActionErrorRepliesAreUnknownOutcomes(t *testing.T) {
-	for _, payload := range []string{"504 Gateway Timeout", "400 Bad Request", "unsupported frame"} {
-		t.Run(payload, func(t *testing.T) {
-			c, err := newTestClient("http://placeholder")
-			if err != nil {
-				t.Fatal(err)
-			}
-			c.SignChainID = 12589
-			server := binwstest.New(t, "h")
-			server.Handle = func(conn *binwstest.Conn, f binws.ClientFrame) {
-				_ = conn.SendJSON(f.ID, fmt.Sprintf(`{"channel":"post","data":{"id":%d,"response":{"type":"error","payload":%q}}}`, f.ID, payload))
-			}
-			session, err := binws.Dial(context.Background(), binws.Config{URL: server.URL(), LoginHost: "h", Sign: c.Signer()})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer session.Close()
-			c.WS = session
-			err = c.Exchange(context.Background(), NewPlace(LimitOrder(0, true, "100", "1", "Alo")))
-			var unknown *UnknownOutcomeError
-			var rejected *ActionRejectedError
-			if !errors.As(err, &unknown) || errors.As(err, &rejected) || errors.Is(err, ErrExecutionRejected) || !strings.Contains(err.Error(), payload) {
-				t.Fatalf("err = %v", err)
-			}
-		})
 	}
 }

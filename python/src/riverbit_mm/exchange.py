@@ -1,10 +1,10 @@
-"""``/exchange`` client: sign, submit over REST or bin-ws, parse receipts."""
+"""``/exchange`` client: sign, submit with REST ``POST /exchange``, parse receipts."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import httpx
 
@@ -22,14 +22,11 @@ from .actions import (
     Place,
     action_type,
 )
-from .errors import NotConnected, NotSent, UnknownOutcome
+from .errors import UnknownOutcome
 from .info import InfoClient
 from .nonce import NonceSource, shared_nonce_source
 from .receipts import Receipt, interpret_reply
 from .signing import DEFAULT_SOURCE, SignedRequest, Signer, normalize_address
-
-if TYPE_CHECKING:
-    from .ws import BinWsSession
 
 #: One submission is bounded by this many seconds. Running out of time leaves the
 #: outcome unknown: the caller reconciles, it never re-signs.
@@ -47,16 +44,9 @@ def _leg_count(action_json: bytes) -> int:
 class ExchangeClient:
     """Signs actions and submits them, one signer at a time.
 
-    ``base_url`` is explicit (for example ``https://pre-api.riverbit.io``). Orders
-    are sent with ``POST /exchange``: **REST is the way to send orders**.
-
-    The ``ws=`` option takes a logged-in :class:`~riverbit_mm.ws.BinWsSession` and
-    carries the same signed bytes as ``action_json`` over bin-ws instead. **The public
-    ``/bin-ws`` endpoint does not accept ``action_json``** (the server answers
-    ``504 Gateway Timeout``), so against it every such request ends as an
-    :class:`~riverbit_mm.UnknownOutcome` and you must not use ``ws=`` there. The option
-    is kept for deployments whose bin-ws endpoint does accept actions. On the public
-    endpoint use bin-ws for market data, order and fill events and ``info_json`` queries.
+    ``base_url`` is explicit (for example ``https://pre-api.riverbit.io``). Orders,
+    cancellations and modifications are submitted with REST ``POST /exchange``;
+    bin-ws carries market data, order and fill events and queries.
 
     ``chain_id`` is ``nextAgentChainId``; if omitted it is fetched once from
     ``chainIdentity``. ``vault_address`` makes every action trade for that vault
@@ -64,9 +54,8 @@ class ExchangeClient:
 
     **Errors.** :meth:`submit` raises :class:`~riverbit_mm.ActionRejected` when the
     whole action was rejected, :class:`~riverbit_mm.UnknownOutcome` when the outcome
-    cannot be known, and :class:`~riverbit_mm.NotSent` only when the bin-ws session
-    was provably not connected. Individual leg rejections are not exceptions: they
-    are in :attr:`Receipt.failed`.
+    cannot be known. Individual leg rejections are not exceptions: they are in
+    :attr:`Receipt.failed`.
     """
 
     def __init__(
@@ -77,7 +66,6 @@ class ExchangeClient:
         chain_id: int | None = None,
         vault_address: str | None = None,
         nonce_source: NonceSource | None = None,
-        ws: BinWsSession | None = None,
         http_client: httpx.AsyncClient | None = None,
         timeout: float = EXCHANGE_TIMEOUT,
         source: str = DEFAULT_SOURCE,
@@ -87,7 +75,6 @@ class ExchangeClient:
         self.chain_id = chain_id
         self.vault_address = normalize_address(vault_address) if vault_address else None
         self.nonce_source = nonce_source or shared_nonce_source(signer.address_lower)
-        self.ws = ws
         self.timeout = timeout
         self.source = source
         self._core = HttpCore(base_url, http_client=http_client, timeout=timeout, sleep=sleep)
@@ -104,7 +91,7 @@ class ExchangeClient:
 
     @property
     def transport(self) -> str:
-        return "bin-ws" if self.ws is not None else "rest"
+        return "rest"
 
     # -- signing ---------------------------------------------------------------------
 
@@ -145,11 +132,11 @@ class ExchangeClient:
         """Send ``request.body`` exactly once and parse the answer.
 
         Submitting the same :class:`SignedRequest` again re-sends identical bytes
-        under the same nonce; do that only after :class:`NotSent`.
+        under the same nonce.
         """
         kind = action_type(request.action_json)
         expected = _leg_count(request.action_json)
-        reply = await (self._send_ws(request) if self.ws is not None else self._send_rest(request))
+        reply = await self._send_rest(request)
         return interpret_reply(
             reply,
             request=request,
@@ -178,21 +165,6 @@ class ExchangeClient:
         except ValueError as exc:
             raise UnknownOutcome(
                 "reply is not valid JSON", request=request, transport="rest", cause=exc
-            ) from exc
-
-    async def _send_ws(self, request: SignedRequest) -> Any:
-        assert self.ws is not None
-        try:
-            return await self.ws.post_action(request.body, timeout=self.timeout)
-        except NotConnected as exc:
-            raise NotSent(str(exc), request=request) from exc
-        except Exception as exc:
-            # Past this point the action may have been written to the socket. A closed
-            # session, a timeout, an error reply, and any reply that is not a well-formed
-            # answer (wrong type, mismatched inner id, undecodable) all leave the outcome
-            # unknown. Cancellation is not caught here and propagates as usual.
-            raise UnknownOutcome(
-                f"{type(exc).__name__}: {exc}", request=request, transport="bin-ws", cause=exc
             ) from exc
 
     # -- conveniences ---------------------------------------------------------------------

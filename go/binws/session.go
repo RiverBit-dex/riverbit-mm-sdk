@@ -33,8 +33,8 @@ type Config struct {
 	Rand         io.Reader         // nil = crypto/rand; login nonce source
 }
 
-// Session is one logged-in bin-ws connection. Market data, order events and
-// signed actions all share it; replies are matched by the outer frame id.
+// Session is one logged-in bin-ws connection. Market data, order and fill events
+// and info queries all share it; replies are matched by the outer frame id.
 type Session struct {
 	cfg    Config
 	conn   *websocket.Conn
@@ -156,7 +156,7 @@ func (s *Session) User() string { return s.login.UserAddress() }
 // Signer is the address that signed the login (API wallet or master itself).
 func (s *Session) Signer() string { return s.login.SignerAddress() }
 
-// URL identifies the transport (used for durable request journals).
+// URL is the bin-ws endpoint the session is connected to.
 func (s *Session) URL() string { return s.cfg.URL }
 
 // Done is closed when the connection ends; Err then reports why.
@@ -224,28 +224,13 @@ func (s *Session) sendJSON(body ClientBody, v any) error {
 // Ping sends an empty WsV2Ping.
 func (s *Session) Ping() error { return s.write(ClientFrame{Body: ClientPing}) }
 
-// PostAction sends a signed /exchange request body as action_json and returns
-// the node's /exchange answer (the "payload" of the post reply). The bytes are
-// sent unchanged: the key order of "action" is part of the signature.
-//
-// The public RiverBit /bin-ws endpoint does not accept action_json: it
-// answers 504 Gateway Timeout. Submit orders with REST POST /exchange there;
-// this method is for gateways that do accept order entry on bin-ws. Any error
-// reply is an unknown outcome, never a rejection.
-//
-// An error does not prove the action was not executed. Preserve the request
-// and reconcile its outcome; do not resend an unknown action.
-func (s *Session) PostAction(ctx context.Context, signedRequest []byte) (json.RawMessage, error) {
-	return s.post(ctx, ClientAction, signedRequest, "action")
-}
-
 // PostInfo sends info_json. bin-ws only serves a whitelist of info types
 // (see the protocol guide); REST /info has no such limit.
 func (s *Session) PostInfo(ctx context.Context, request []byte) (json.RawMessage, error) {
-	return s.post(ctx, ClientInfo, request, "info")
+	return s.post(ctx, ClientInfo, request)
 }
 
-func (s *Session) post(ctx context.Context, body ClientBody, data []byte, wantType string) (json.RawMessage, error) {
+func (s *Session) post(ctx context.Context, body ClientBody, data []byte) (json.RawMessage, error) {
 	ch := make(chan ServerFrame, 1)
 	s.mu.Lock()
 	if s.err != nil {
@@ -263,15 +248,15 @@ func (s *Session) post(ctx context.Context, body ClientBody, data []byte, wantTy
 		s.mu.Unlock()
 	}()
 	if err := s.write(ClientFrame{ID: id, Body: body, Data: data}); err != nil {
-		return nil, fmt.Errorf("send %s request id=%d: %w", wantType, id, err)
+		return nil, fmt.Errorf("send info request id=%d: %w", id, err)
 	}
 	select {
 	case <-ctx.Done():
-		return nil, fmt.Errorf("%s request id=%d: no reply: %w", wantType, id, ctx.Err())
+		return nil, fmt.Errorf("info request id=%d: no reply: %w", id, ctx.Err())
 	case <-s.done:
-		return nil, fmt.Errorf("%s request id=%d: connection ended before the reply: %v", wantType, id, s.Err())
+		return nil, fmt.Errorf("info request id=%d: connection ended before the reply: %v", id, s.Err())
 	case reply := <-ch:
-		return parsePostReply(reply, id, wantType)
+		return parsePostReply(reply, id)
 	}
 }
 
@@ -289,8 +274,8 @@ func (e *PostReplyError) Error() string {
 
 // parsePostReply checks that frame is the reply to request id and returns its payload:
 //
-//	{"channel":"post","data":{"id":<id>,"response":{"type":"action"|"info","payload":..}}}
-func parsePostReply(frame ServerFrame, id uint64, wantType string) (json.RawMessage, error) {
+//	{"channel":"post","data":{"id":<id>,"response":{"type":"info","payload":..}}}
+func parsePostReply(frame ServerFrame, id uint64) (json.RawMessage, error) {
 	if frame.ID != id {
 		return nil, fmt.Errorf("reply frame id=%d, request id=%d", frame.ID, id)
 	}
@@ -317,7 +302,7 @@ func parsePostReply(frame ServerFrame, id uint64, wantType string) (json.RawMess
 		return nil, fmt.Errorf("reply to request id=%d carries data.id=%d", id, *push.Data.ID)
 	}
 	switch push.Data.Response.Type {
-	case wantType:
+	case "info":
 		if len(push.Data.Response.Payload) == 0 {
 			return nil, fmt.Errorf("reply to request id=%d has no payload", id)
 		}
@@ -329,7 +314,7 @@ func parsePostReply(frame ServerFrame, id uint64, wantType string) (json.RawMess
 		}
 		return nil, &PostReplyError{ID: id, Payload: text}
 	}
-	return nil, fmt.Errorf("reply to request id=%d: response type %q, want %q", id, push.Data.Response.Type, wantType)
+	return nil, fmt.Errorf("reply to request id=%d: response type %q, want %q", id, push.Data.Response.Type, "info")
 }
 
 func (s *Session) readLoop() {

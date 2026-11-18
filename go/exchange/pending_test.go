@@ -13,116 +13,93 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/riverbit-dex/riverbit-mm-sdk/go/binws"
-	"github.com/riverbit-dex/riverbit-mm-sdk/go/binws/binwstest"
 )
 
 // The second replacement is rejected and its old order is still open. The
 // successful replacement is only visible after restart. Neither the rejected
 // cloid nor cancellation of its old order can ever appear in /info.
 func TestMixedBatchReceiptSurvivesRestart(t *testing.T) {
-	for _, transport := range []string{"rest", "ws"} {
-		for _, committed := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/committed=%t", transport, committed), func(t *testing.T) {
-				c := restVaultClient(t)
-				c.RequireExecutionHeight = true
-				var sends atomic.Int32
-				var visible atomic.Bool
-				const receipt = `{"type":"order","data":{"statuses":[{"resting":{"oid":101}},{"error":"Order was never placed, already canceled, or filled."}]}}`
-				exchange := func() string {
-					sends.Add(1)
-					if committed {
-						return `{"status":"err","response":"query the order status","committedResult":` + receipt + `}`
-					}
-					return `{"status":"ok","response":` + receipt + `}`
+	for _, committed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("committed=%t", committed), func(t *testing.T) {
+			c := restVaultClient(t)
+			c.RequireExecutionHeight = true
+			var sends atomic.Int32
+			var visible atomic.Bool
+			const receipt = `{"type":"order","data":{"statuses":[{"resting":{"oid":101}},{"error":"Order was never placed, already canceled, or filled."}]}}`
+			exchange := func() string {
+				sends.Add(1)
+				if committed {
+					return `{"status":"err","response":"query the order status","committedResult":` + receipt + `}`
 				}
-				query := func(body []byte) string {
-					var q struct {
-						OID uint64 `json:"oid"`
-					}
-					if err := json.Unmarshal(body, &q); err != nil {
-						t.Errorf("receipt must reconcile the new OID, not a reusable cloid: %s", body)
-					}
-					if q.OID != 101 && q.OID != 11 {
-						t.Errorf("must not wait for the rejected leg: %s", body)
-					}
-					if !visible.Load() {
-						return `{"height":9,"status":"unknownOid"}`
-					}
-					status := "open"
-					if q.OID == 11 {
-						status = "canceled"
-					}
-					return fmt.Sprintf(`{"height":10,"status":"order","order":{"status":%q,"order":{"oid":%d}}}`, status, q.OID)
+				return `{"status":"ok","response":` + receipt + `}`
+			}
+			query := func(body []byte) string {
+				var q struct {
+					OID uint64 `json:"oid"`
 				}
-				httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if r.URL.Path == "/exchange" {
-						fmt.Fprint(w, exchange())
-						return
-					}
-					var body json.RawMessage
-					_ = json.NewDecoder(r.Body).Decode(&body)
-					fmt.Fprint(w, query(body))
-				}))
-				defer httpServer.Close()
-				c.URL = httpServer.URL
-				if transport == "ws" {
-					server := binwstest.New(t, "h")
-					server.Handle = func(conn *binwstest.Conn, f binws.ClientFrame) {
-						typ, payload := "info", ""
-						if f.Body == binws.ClientAction {
-							typ, payload = "action", exchange()
-						} else {
-							payload = `{"type":"orderStatus","data":` + query(f.Data) + `}`
-						}
-						_ = conn.SendJSON(f.ID, fmt.Sprintf(`{"channel":"post","data":{"id":%d,"response":{"type":%q,"payload":%s}}}`, f.ID, typ, payload))
-					}
-					session, err := binws.Dial(context.Background(), binws.Config{URL: server.URL(), LoginHost: "h", Sign: c.Signer()})
-					if err != nil {
-						t.Fatal(err)
-					}
-					defer session.Close()
-					c.WS, c.Queries = session, session
+				if err := json.Unmarshal(body, &q); err != nil {
+					t.Errorf("receipt must reconcile the new OID, not a reusable cloid: %s", body)
 				}
-				batch := BatchModify{Type: "batchModify", Modifies: []ModifyItem{{OID: 11, Order: alo("100")}, {OID: 12, Order: alo("99")}}}
-				var action any = batch
-				if committed { // Exercise both exported action forms.
-					action = &batch
+				if q.OID != 101 && q.OID != 11 {
+					t.Errorf("must not wait for the rejected leg: %s", body)
 				}
-				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-				err := c.Exchange(ctx, action)
-				cancel()
-				if !errors.Is(err, context.DeadlineExceeded) {
-					t.Fatalf("first reconciliation = %v", err)
+				if !visible.Load() {
+					return `{"height":9,"status":"unknownOid"}`
 				}
-				pending, err := c.loadPending()
-				if err != nil || pending == nil || string(pending.BatchReceipt) != receipt {
-					t.Fatalf("durable receipt = %+v, %v", pending, err)
+				status := "open"
+				if q.OID == 11 {
+					status = "canceled"
 				}
-				fresh := restVaultClient(t)
-				fresh.URL, fresh.StateDir, fresh.WS, fresh.Queries = c.URL, c.StateDir, c.WS, c.Queries
-				fresh.RequireExecutionHeight = true
-				visible.Store(true)
-				ctx, cancel = context.WithTimeout(context.Background(), time.Second)
-				err = fresh.RecoverPending(ctx)
-				cancel()
-				var partial *PartialExecutionError
-				if errors.Is(err, ErrExecutionRejected) || !errors.As(err, &partial) || !strings.Contains(err.Error(), "Order was never placed") {
-					t.Fatalf("a partly rejected batch must be a partial execution, not a whole rejection: %v", err)
+				return fmt.Sprintf(`{"height":10,"status":"order","order":{"status":%q,"order":{"oid":%d}}}`, status, q.OID)
+			}
+			httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/exchange" {
+					fmt.Fprint(w, exchange())
+					return
 				}
-				if len(partial.Executed) != 1 || partial.Executed[0].Index != 0 || partial.Executed[0].OID != 101 ||
-					len(partial.Rejected) != 1 || partial.Rejected[0].Index != 1 || !strings.Contains(partial.Rejected[0].Error, "Order was never placed") {
-					t.Fatalf("per-leg result = %+v", partial)
-				}
-				if sends.Load() != 1 || len(fresh.LastOrderIDs) != 1 || fresh.LastOrderIDs[0] != 101 || fresh.LastExecutionHeight != 10 {
-					t.Fatalf("sends=%d ids=%v height=%d", sends.Load(), fresh.LastOrderIDs, fresh.LastExecutionHeight)
-				}
-				if _, err := os.Stat(c.pendingPath()); !os.IsNotExist(err) {
-					t.Fatalf("resolved pending remains: %v", err)
-				}
-			})
-		}
+				var body json.RawMessage
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				fmt.Fprint(w, query(body))
+			}))
+			defer httpServer.Close()
+			c.URL = httpServer.URL
+			batch := BatchModify{Type: "batchModify", Modifies: []ModifyItem{{OID: 11, Order: alo("100")}, {OID: 12, Order: alo("99")}}}
+			var action any = batch
+			if committed { // Exercise both exported action forms.
+				action = &batch
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			err := c.Exchange(ctx, action)
+			cancel()
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("first reconciliation = %v", err)
+			}
+			pending, err := c.loadPending()
+			if err != nil || pending == nil || string(pending.BatchReceipt) != receipt {
+				t.Fatalf("durable receipt = %+v, %v", pending, err)
+			}
+			fresh := restVaultClient(t)
+			fresh.URL, fresh.StateDir = c.URL, c.StateDir
+			fresh.RequireExecutionHeight = true
+			visible.Store(true)
+			ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+			err = fresh.RecoverPending(ctx)
+			cancel()
+			var partial *PartialExecutionError
+			if errors.Is(err, ErrExecutionRejected) || !errors.As(err, &partial) || !strings.Contains(err.Error(), "Order was never placed") {
+				t.Fatalf("a partly rejected batch must be a partial execution, not a whole rejection: %v", err)
+			}
+			if len(partial.Executed) != 1 || partial.Executed[0].Index != 0 || partial.Executed[0].OID != 101 ||
+				len(partial.Rejected) != 1 || partial.Rejected[0].Index != 1 || !strings.Contains(partial.Rejected[0].Error, "Order was never placed") {
+				t.Fatalf("per-leg result = %+v", partial)
+			}
+			if sends.Load() != 1 || len(fresh.LastOrderIDs) != 1 || fresh.LastOrderIDs[0] != 101 || fresh.LastExecutionHeight != 10 {
+				t.Fatalf("sends=%d ids=%v height=%d", sends.Load(), fresh.LastOrderIDs, fresh.LastExecutionHeight)
+			}
+			if _, err := os.Stat(c.pendingPath()); !os.IsNotExist(err) {
+				t.Fatalf("resolved pending remains: %v", err)
+			}
+		})
 	}
 }
 

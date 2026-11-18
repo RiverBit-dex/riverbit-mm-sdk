@@ -1,11 +1,9 @@
 //! Transports: how signed actions and info queries reach the exchange.
 //!
-//! REST is the default and the way to send orders: `POST /exchange`. A
-//! logged-in [`BinWsSession`](crate::BinWsSession) also implements both traits,
-//! but the public `/bin-ws` endpoint does not accept `action_json` (the server
-//! replies `504 Gateway Timeout`); it serves market data, order and fill events
-//! and `info_json` queries. The bin-ws action transport is kept for endpoints
-//! that do accept it.
+//! Orders, cancellations and modifications are sent with REST `POST /exchange`.
+//! `/info` queries go over REST too, or, for the query types bin-ws accepts,
+//! over a logged-in [`BinWsSession`](crate::BinWsSession) as `info_json`
+//! through [`InfoTransport`].
 
 use std::future::Future;
 use std::pin::Pin;
@@ -25,9 +23,6 @@ pub enum TransportError {
     Disconnected(String),
     /// The request could not be written (no connection, connect failure).
     SendFailed(String),
-    /// The request was provably never written, so it cannot have executed.
-    /// Only a transport that can prove this reports it.
-    NotSent(String),
     /// A non-success HTTP status.
     Status {
         /// The status code.
@@ -37,7 +32,8 @@ pub enum TransportError {
         /// The parsed `Retry-After`, if any.
         retry_after: Option<Duration>,
     },
-    /// An error reply on bin-ws (`{"type":"error"}`), for example `429 ...`.
+    /// An error reply to a bin-ws `info_json` query (`{"type":"error"}`),
+    /// for example `429 ...`.
     ErrorReply(String),
     /// Anything else.
     Other(String),
@@ -60,15 +56,6 @@ impl TransportError {
             _ => None,
         }
     }
-}
-
-/// Carries signed `/exchange` request bodies.
-///
-/// Implementations must send the bytes unchanged and return the body of the
-/// exchange's answer.
-pub trait ActionTransport: Send + Sync {
-    /// Sends one signed request body.
-    fn post_action<'a>(&'a self, body: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>, TransportError>>;
 }
 
 /// Carries `/info` queries and returns the same body REST would return.
@@ -186,20 +173,20 @@ pub(crate) struct RestActions {
     pub timeout: Duration,
 }
 
-impl ActionTransport for RestActions {
-    fn post_action<'a>(&'a self, body: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>, TransportError>> {
-        Box::pin(async move {
-            let reply = self.rest.post("/exchange", body, self.timeout).await?;
-            if reply.status == 200 {
-                Ok(reply.body)
-            } else {
-                Err(TransportError::Status {
-                    status: reply.status,
-                    body: truncate(&reply.body),
-                    retry_after: reply.retry_after,
-                })
-            }
-        })
+impl RestActions {
+    /// Sends one signed request body, unchanged, and returns the body of the
+    /// exchange's answer.
+    pub(crate) async fn post_action(&self, body: &[u8]) -> Result<Vec<u8>, TransportError> {
+        let reply = self.rest.post("/exchange", body, self.timeout).await?;
+        if reply.status == 200 {
+            Ok(reply.body)
+        } else {
+            Err(TransportError::Status {
+                status: reply.status,
+                body: truncate(&reply.body),
+                retry_after: reply.retry_after,
+            })
+        }
     }
 }
 

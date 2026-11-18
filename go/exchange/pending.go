@@ -68,12 +68,7 @@ func (c *Client) journalIdentity() string {
 	}
 	return c.SignerAddress() + "-" + c.AccountAddress()
 }
-func (c *Client) transportIdentity() string {
-	if c.WS != nil {
-		return "binary-ws:" + c.WS.URL()
-	}
-	return "http"
-}
+func (c *Client) transportIdentity() string { return "http" }
 func (c *Client) pendingPath() string {
 	return filepath.Join(c.StateDir, c.journalIdentity()+".pending.json")
 }

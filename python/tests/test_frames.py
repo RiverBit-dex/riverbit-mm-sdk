@@ -58,7 +58,6 @@ def _server_name(body: Any) -> str:
 
 
 _CLIENT_BODIES = {
-    fr.CLIENT_ACTION: "action_json",
     fr.CLIENT_INFO: "info_json",
     fr.CLIENT_SUBSCRIBE: "subscribe_json",
     fr.CLIENT_UNSUBSCRIBE: "unsubscribe_json",
@@ -221,6 +220,12 @@ def test_optional_zero_is_present() -> None:
     assert fr.L2DeltaUpdate.decode(fr.L2DeltaUpdate("BTC", 1, 1, 1).encode()).spread is None
     bbo = fr.Bbo("BTC", 1, 1, 1, bid_px=0, bid_sz=0)
     assert fr.Bbo.decode(bbo.encode()).bid_px == 0
+
+
+def test_client_frame_rejects_unknown_body_field() -> None:
+    raw = pb.enc_varint(1, 7) + pb.enc_bytes_always(2, b"{}")
+    with pytest.raises(ProtocolError):
+        fr.decode_client_frame(raw)
 
 
 def test_json_frame_properties() -> None:

@@ -7,11 +7,10 @@ syntax = "proto3";
 package riverbit.api.v1;
 
 message WsV2ClientFrame {
-  // Request id for post bodies (action/info); ignored otherwise.
+  // Request id for info requests; ignored otherwise.
   uint64 id = 1;
+  reserved 2;
   oneof body {
-    // Exact signed action JSON bytes (the same body as REST POST /exchange).
-    bytes action_json = 2;
     // Info payload JSON, for example {"type":"openOrders","user":"0x..."}.
     bytes info_json = 3;
     // Subscription object JSON, for example {"type":"candle","coin":"BTC","interval":"1m"}.

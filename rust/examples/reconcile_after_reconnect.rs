@@ -6,8 +6,8 @@
 //!   cargo run --example reconcile_after_reconnect
 //! ```
 //!
-//! Orders go out as `POST /exchange`: the public bin-ws endpoint does not
-//! accept `action_json`. The bin-ws session carries the `orderUpdates` stream.
+//! Orders go out as `POST /exchange`. The bin-ws session carries the
+//! `orderUpdates` stream.
 //! If the order's outcome is unknown (timeout, HTTP error, ambiguous reply) the
 //! example keeps the signed request, looks the order up by its cloid, and looks
 //! again each time the session reconnects. It never signs the order again.
