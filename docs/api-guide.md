@@ -24,6 +24,9 @@ All `/info` queries are POST JSON with a `type` field:
 | `candleSnapshot` | `req`: `coin`, `interval`, `startTime`, `endTime` | Historical candles |
 | `openOrders`, `frontendOpenOrders`, `userFills`, `clearinghouseState` | `user` | Orders, fills and positions |
 | `orderStatus` | `user`, `oid` | Single order status |
+| `subAccounts` | `user` (the signer's address) | Sub-accounts of a master: entries with `name`, `subAccountUser` and `master`; check that the sub-account you trade for is listed under the signer |
+| `vaultRegistry` | `vault` (address) | Registry entry of a vault: `vaultAddress`, `status` (trade only when `normal`) and `class` |
+| `vaultDetails` | `vaultAddress` | Vault details; `leader` is the account that leads the vault, which must be the signer or the master the signer is an API wallet of |
 
 An API wallet signs; the master address identifies the account for queries and subscriptions. To trade for a vault, include top-level `vaultAddress`; use the vault address as `user` for vault queries and subscriptions. The vault must be led by the master, and the signer must be the leader or its authorized API wallet. Do not confuse signer and master addresses. `userRole` returns `agent` with `data.user`, `user`, `subAccount` with `data.master`, `vault`, or `missing`. Vault classes include `protocol`, `guild`, `priority` and `user`.
 

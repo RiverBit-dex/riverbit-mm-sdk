@@ -2,7 +2,9 @@
 
 Go client library for the RiverBit exchange API: signing, order entry, cancellation, modification, market data over the binary WebSocket (`bin-ws`), and reconciliation of requests whose outcome is unknown.
 
-> **Status: pre-release.** Interfaces may change before `v0.1.0`. The library contains no quoting strategy. Read the [protocol guide](../docs/api-guide.md) first; this README only shows how the Go packages map onto it.
+> **Status: pre-release.** Interfaces may change before `v0.1.0`. The SDK contains no quoting strategy: it gives you the protocol, signing and reconciliation building blocks to run your own. Read the [protocol guide](../docs/api-guide.md) before you trade.
+
+Repository: <https://github.com/RiverBit-dex/riverbit-mm-sdk>
 
 ## Install
 
@@ -10,7 +12,7 @@ Go client library for the RiverBit exchange API: signing, order entry, cancellat
 go get github.com/riverbit-dex/riverbit-mm-sdk/go@latest
 ```
 
-Requires Go 1.26 or newer. The module path ends in `/go` because the repository holds one library per language.
+Requires Go 1.24 or newer. The module path ends in `/go` because the repository holds one library per language.
 
 ## Packages
 
@@ -110,7 +112,7 @@ func main() {
 | Action signing (EIP-712, MessagePack key order, with or without a vault) | `exchange.Client.Sign`, `SignedRequest` | Signed bytes and sent bytes are the same bytes. Reproduces every vector in `testdata/vectors.json` byte for byte |
 | bin-ws login signing (EIP-191) | `exchange.Signer.PersonalSign`, `binws.NewLogin` | `binws.Signer` is an interface, so a remote or hardware key can sign |
 | Actions: `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify` | `exchange.Place`, `Cancel`, `CancelByCloid`, `Modify`, `BatchModify`; `NewPlace`, `LimitOrder`, ... | Prices and sizes are decimal strings end to end. `exchange.Cloid` is a 128-bit client order ID |
-| REST `/info` | `exchange.InfoClient` | `Query` for any type; typed helpers for `chainIdentity`, `metaAndAssetCtxs`, `userRole`, `openOrders`. 429 is retried honoring `Retry-After` |
+| REST `/info` | `exchange.InfoClient` | `Query` for any type; typed helpers for `chainIdentity`, `metaAndAssetCtxs`, `userRole`, `openOrders`. 429 is retried: it waits for `Retry-After` when present, otherwise capped exponential backoff |
 | REST `/exchange` | `exchange.Client` | One request body for REST and bin-ws |
 | bin-ws session | `binws.Dial`, `Session` | First-frame login, subscribe/unsubscribe, ping, `action_json` and `info_json` requests matched by frame id |
 | Reconnect | `binws.Run` | Reconnect, log in again, resubscribe, with backoff |
@@ -126,6 +128,7 @@ Not included: quoting or risk logic, automatic cancellation on shutdown, a cross
 
 ## API overview
 
+- Action types: `Place` is the `order` action and `Order` is one order leg; `CancelItem`, `CancelByCloidItem` and `ModifyItem` are the legs of `cancel`, `cancelByCloid` and `batchModify`. Constructors: `NewPlace(orders...)`, `NewCancel(items...)`, `NewCancelByCloid(items...)`, `NewModify(oid, order)`, `NewBatchModify(items...)`.
 - `exchange.NewSigner(hexKey)` loads a key. `exchange.New(url, signer)` trades for the signer's own account; `NewForVault(url, signer, vault)` for a vault; `SetPrincipal(master)` records the master an API wallet acts for. Call `VerifySubAccount` before trading for a vault.
 - Set `SignChainID` through `Client.LoadChainID`; there is no default, and a wrong value gives code 91.
 - `Client.Exchange(ctx, action)` signs, sends and reconciles. `LastOrderIDs`, `LastStatuses` and `LastReceipt` describe the last request. `RecoverPending(ctx)` only observes: it queries and never submits.

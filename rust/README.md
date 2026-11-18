@@ -2,7 +2,9 @@
 
 An async Rust client for market makers integrating with the RiverBit exchange API: signing, order entry, cancellation, modification, market data and reconciliation over REST and the binary WebSocket endpoint (`bin-ws`).
 
-> **Status: pre-release (`0.1.0`, not published to crates.io).** Interfaces may change. The SDK contains no quoting strategy: it gives you the protocol, signing and reconciliation building blocks to run your own. Read the [protocol guide](../docs/api-guide.md) first; it explains the rules this crate enforces.
+> **Status: pre-release.** Interfaces may change before `v0.1.0`. The SDK contains no quoting strategy: it gives you the protocol, signing and reconciliation building blocks to run your own. Read the [protocol guide](../docs/api-guide.md) before you trade.
+
+Repository: <https://github.com/RiverBit-dex/riverbit-mm-sdk>
 
 - Async on [tokio](https://tokio.rs), TLS via [rustls](https://github.com/rustls/rustls) (no OpenSSL), `#![forbid(unsafe_code)]`.
 - No `protoc` needed: the `bin-ws` frames are decoded by a small hand-written codec (see [`proto/binws.proto`](../proto/binws.proto)).
@@ -14,7 +16,7 @@ The crate is not on crates.io yet. Add it as a Git dependency and pin a commit o
 
 ```toml
 [dependencies]
-riverbit-mm-sdk = { git = "https://github.com/riverbit-dex/riverbit-mm-sdk", rev = "<commit>" }
+riverbit-mm-sdk = { git = "https://github.com/RiverBit-dex/riverbit-mm-sdk", rev = "<commit>" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -113,7 +115,7 @@ The examples read `RIVERBIT_PRIVATE_KEY` and, optionally, `RIVERBIT_BASE_URL`, `
 |---|---|
 | `Signer` | Holds the key. `sign_action`, `sign_request`, `sign_login`, `personal_sign`, `address` |
 | `SigningDomain` | `chain_id` (from `chainIdentity.nextAgentChainId`) and agent `source` (`"b"`) |
-| `Order`, `Place`, `Cancel`, `CancelByCloid`, `Modify`, `BatchModify` | Actions with fixed field order. `Order` is one leg; the others are the signed action types. `Action::to_json` is the exact string that is signed and sent |
+| `Order`, `Place`, `Cancel` / `CancelItem`, `CancelByCloid` / `CancelByCloidItem`, `Modify`, `BatchModify` / `ModifyItem` | Actions with fixed field order. `Place` is the `order` action and `Order` is one order leg; `CancelItem`, `CancelByCloidItem` and `ModifyItem` are the legs of `cancel`, `cancelByCloid` and `batchModify`. `Place::new` takes `Order`s, `Cancel::new` takes `CancelItem`s, `CancelByCloid::new` takes `CancelByCloidItem`s, `BatchModify::new` takes `ModifyItem`s; `Modify` has one `oid` and one `order`. `Action::to_json` is the exact string that is signed and sent |
 | `Cloid` | 128-bit client order ID, `0x` plus 32 hex digits |
 | `NonceSource` | Millisecond nonces, strictly increasing; one shared counter per signer in a process |
 | `SignedRequest` | A signed request body, nonce and targets. `ExchangeClient::prepare` creates one; `submit` sends it |
