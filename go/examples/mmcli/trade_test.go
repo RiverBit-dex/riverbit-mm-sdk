@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -50,8 +49,8 @@ func testSigner() string {
 	return strings.ToLower(crypto.PubkeyToAddress(key.PublicKey).Hex())
 }
 
-// fakeGateway is the HTTP side: POST /info always (startup queries), plus
-// POST /exchange and the orderStatus/openOrders reconciliation when rest is set.
+// fakeGateway is the HTTP side: POST /info (startup and reconciliation
+// queries) and POST /exchange.
 type fakeGateway struct {
 	*httptest.Server
 	mu                  sync.Mutex
@@ -62,17 +61,12 @@ type fakeGateway struct {
 	orderStatusObserved chan struct{}
 }
 
-func newFakeGateway(t *testing.T, account string, rest bool) *fakeGateway {
+func newFakeGateway(t *testing.T, account string) *fakeGateway {
 	g := &fakeGateway{orderStatusObserved: make(chan struct{}, 1)}
 	signer := testSigner()
 	g.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		if r.URL.Path == "/exchange" {
-			if !rest {
-				t.Errorf("ws mode must not POST /exchange: %s", body)
-				http.Error(w, "unexpected", http.StatusBadRequest)
-				return
-			}
 			var req struct {
 				Action exchange.Place `json:"action"`
 			}
@@ -115,9 +109,6 @@ func newFakeGateway(t *testing.T, account string, rest bool) *fakeGateway {
 		case "metaAndAssetCtxs":
 			fmt.Fprint(w, `[{"universe":[{"name":"RBT","szDecimals":2,"maxLeverage":20},{"name":"BTC","szDecimals":5,"maxLeverage":40}]},[]]`)
 		case "orderStatus", "openOrders":
-			if !rest {
-				t.Errorf("ws mode must reconcile over info_json, got HTTP %s", body)
-			}
 			if q["user"] != account {
 				t.Errorf("%s user = %v, want %s", typ, q["user"], account)
 			}
@@ -160,110 +151,68 @@ func newFakeGateway(t *testing.T, account string, rest bool) *fakeGateway {
 // recover reconnects using the same identity but never reads ACTION_FILE or
 // submits another exchange. It works for a vault and an API wallet's master.
 func TestRecoverCommandNeverSubmitsActions(t *testing.T) {
-	for _, transport := range []string{OrderTransportREST, OrderTransportWS} {
-		for _, vault := range []string{"", testVault} {
-			t.Run(transport+"/vault="+vault, func(t *testing.T) {
-				account := testLeader
-				if vault != "" {
-					account = vault
-				}
-				gateway := newFakeGateway(t, account, transport == OrderTransportREST)
-				gateway.unknown = true
-				var visible atomic.Bool
-				var sends atomic.Int32
-				ws := binwstest.New(t, "pre-api.riverbit.io")
-				ws.User = testLeader
-				ws.Handle = func(conn *binwstest.Conn, f binws.ClientFrame) {
-					if f.Body == binws.ClientSubscribe {
-						return
-					}
-					typ, payload := "action", `{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":501}}]}}}`
-					if f.Body == binws.ClientAction {
-						sends.Add(1)
-					} else {
-						var q struct {
-							Type string `json:"type"`
-						}
-						_ = json.Unmarshal(f.Data, &q)
-						data := `[]`
-						if q.Type == "orderStatus" {
-							data = `{"height":3,"status":"unknownOid"}`
-							select {
-							case gateway.orderStatusObserved <- struct{}{}:
-							default:
-							}
-							if visible.Load() {
-								data = `{"height":3,"status":"order","order":{"status":"open","order":{"oid":501}}}`
-							}
-						}
-						typ, payload = "info", fmt.Sprintf(`{"type":%q,"data":%s}`, q.Type, data)
-					}
-					_ = conn.SendJSON(f.ID, fmt.Sprintf(`{"channel":"post","data":{"id":%d,"response":{"type":%q,"payload":%s}}}`, f.ID, typ, payload))
-				}
-				cfg := tradeConfig(t, ws.URL(), gateway.URL, vault, transport)
-				c, err := newClient(cfg, vault)
-				if err != nil {
+	for _, vault := range []string{"", testVault} {
+		t.Run("vault="+vault, func(t *testing.T) {
+			account := testLeader
+			if vault != "" {
+				account = vault
+			}
+			gateway := newFakeGateway(t, account)
+			gateway.unknown = true
+			cfg := tradeConfig(t, "ws://127.0.0.1:1/bin-ws", gateway.URL, vault)
+			c, err := newClient(cfg, vault)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.StateDir, c.SignChainID = cfg.StateDir, 12581
+			if vault == "" {
+				if err := c.SetPrincipal(testLeader); err != nil {
 					t.Fatal(err)
 				}
-				c.StateDir, c.SignChainID = cfg.StateDir, 12581
-				if vault == "" {
-					if err := c.SetPrincipal(testLeader); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if transport == OrderTransportWS {
-					session, err := binws.Dial(context.Background(), binws.Config{URL: ws.URL(), LoginHost: cfg.BinWSLoginHost, Sign: c.Signer()})
-					if err != nil {
-						t.Fatal(err)
-					}
-					defer session.Close()
-					c.WS, c.Queries = session, session
-				}
-				// Cancel only after submission and the first reconciliation query.
-				// A short wall-clock deadline can expire before HTTP sends anything
-				// on a loaded race-test runner, leaving no submitted request to recover.
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-				submitted := make(chan error, 1)
-				go func() {
-					submitted <- c.Exchange(ctx, &exchange.Place{Type: "order", Orders: []exchange.Order{{Asset: 0, Price: "100", Size: "1", Type: exchange.OrderType{Limit: exchange.Limit{TIF: "Alo"}}}}, Grouping: "na"})
-				}()
-				select {
-				case <-gateway.orderStatusObserved:
-					cancel()
-				case <-ctx.Done():
-					t.Fatalf("initial request never reached reconciliation: %v", ctx.Err())
-				}
-				if err = <-submitted; !errors.Is(err, context.Canceled) {
-					t.Fatalf("prepare pending: %v", err)
-				}
-				gateway.mu.Lock()
-				gateway.unknown = false
-				gateway.mu.Unlock()
-				visible.Store(true)
-				t.Setenv("ACTION_FILE", "/does-not-exist.json")
-				ctx, cancel = context.WithTimeout(context.Background(), time.Second)
-				err = runTrade(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), true)
+			}
+			// Cancel only after submission and the first reconciliation query.
+			// A short wall-clock deadline can expire before HTTP sends anything
+			// on a loaded race-test runner, leaving no submitted request to recover.
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			submitted := make(chan error, 1)
+			go func() {
+				submitted <- c.Exchange(ctx, &exchange.Place{Type: "order", Orders: []exchange.Order{{Asset: 0, Price: "100", Size: "1", Type: exchange.OrderType{Limit: exchange.Limit{TIF: "Alo"}}}}, Grouping: "na"})
+			}()
+			select {
+			case <-gateway.orderStatusObserved:
 				cancel()
-				if err != nil {
-					t.Fatal(err)
-				}
-				gateway.mu.Lock()
-				count := len(gateway.exchanges)
-				gateway.mu.Unlock()
-				if count+int(sends.Load()) != 1 {
-					t.Fatalf("recovery submitted actions: HTTP=%d WS=%d", count, sends.Load())
-				}
-				files, err := filepath.Glob(filepath.Join(cfg.StateDir, "*.pending.json"))
-				if err != nil || len(files) != 0 {
-					t.Fatalf("pending after recovery: %v, %v", files, err)
-				}
-			})
-		}
+			case <-ctx.Done():
+				t.Fatalf("initial request never reached reconciliation: %v", ctx.Err())
+			}
+			if err = <-submitted; !errors.Is(err, context.Canceled) {
+				t.Fatalf("prepare pending: %v", err)
+			}
+			gateway.mu.Lock()
+			gateway.unknown = false
+			gateway.mu.Unlock()
+			t.Setenv("ACTION_FILE", "/does-not-exist.json")
+			ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+			err = runTrade(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), true)
+			cancel()
+			if err != nil {
+				t.Fatal(err)
+			}
+			gateway.mu.Lock()
+			count := len(gateway.exchanges)
+			gateway.mu.Unlock()
+			if count != 1 {
+				t.Fatalf("recovery submitted actions: /exchange requests = %d, want 1", count)
+			}
+			files, err := filepath.Glob(filepath.Join(cfg.StateDir, "*.pending.json"))
+			if err != nil || len(files) != 0 {
+				t.Fatalf("pending after recovery: %v, %v", files, err)
+			}
+		})
 	}
 }
 
-func tradeConfig(t *testing.T, binWSURL, gatewayURL, vault, transport string) Config {
+func tradeConfig(t *testing.T, binWSURL, gatewayURL, vault string) Config {
 	dir := t.TempDir()
 	keyFile := filepath.Join(dir, "key")
 	if err := os.WriteFile(keyFile, []byte(testKeyHex+"\n"), 0600); err != nil {
@@ -272,7 +221,7 @@ func tradeConfig(t *testing.T, binWSURL, gatewayURL, vault, transport string) Co
 	t.Setenv("ACTION_FILE", "actions/btc-batch-order.sample.json")
 	return Config{
 		BinWSURL: binWSURL, BinWSLoginHost: "pre-api.riverbit.io", APIGatewayURL: gatewayURL,
-		Coin: "BTC", BookStream: "l2", OrderTransport: transport, GuildVault: vault, KeyFile: keyFile, StateDir: filepath.Join(dir, "state"),
+		Coin: "BTC", BookStream: "l2", GuildVault: vault, KeyFile: keyFile, StateDir: filepath.Join(dir, "state"),
 	}
 }
 
@@ -283,92 +232,20 @@ type signedPlace struct {
 	VaultAddress string             `json:"vaultAddress"`
 }
 
-// The whole `trade` command for a vault in ws mode: HTTP startup checks, one
-// bin-ws login, order-event subscriptions for the vault, the signed order as
-// action_json, then orderStatus / openOrders as info_json on the same
-// connection.
-func TestTradeForVaultOverBinWS(t *testing.T) {
-	var mu sync.Mutex
-	var frames []string // client frames in arrival order: "subscribe:<json>" / "action:<json>" / "info:<json>"
+// The whole `trade` command for a vault: no bin-ws connection. The signed
+// order is POSTed to /exchange and reconciled with orderStatus and openOrders
+// over POST /info.
+func TestTradeForVault(t *testing.T) {
 	ws := binwstest.New(t, "pre-api.riverbit.io")
-	ws.User = testLeader
-	ws.Handle = func(c *binwstest.Conn, f binws.ClientFrame) {
-		mu.Lock()
-		defer mu.Unlock()
-		switch f.Body {
-		case binws.ClientSubscribe:
-			frames = append(frames, "subscribe:"+string(f.Data))
-		case binws.ClientAction:
-			frames = append(frames, "action:"+string(f.Data))
-			_ = c.SendJSON(f.ID, fmt.Sprintf(`{"channel":"post","data":{"id":%d,"response":{"type":"action","payload":{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":501}},{"resting":{"oid":502}}]}}}}}}`, f.ID))
-		case binws.ClientInfo:
-			frames = append(frames, "info:"+string(f.Data))
-			var q struct {
-				Type string `json:"type"`
-				User string `json:"user"`
-				OID  uint64 `json:"oid"`
-			}
-			_ = json.Unmarshal(f.Data, &q)
-			if q.User != testVault {
-				t.Errorf("info_json %s user = %s, want the vault", q.Type, q.User)
-			}
-			data := `[]`
-			if q.Type == "orderStatus" {
-				data = fmt.Sprintf(`{"height":3,"status":"order","order":{"status":"open","order":{"coin":"BTC","oid":%d}}}`, q.OID)
-			}
-			_ = c.SendJSON(f.ID, fmt.Sprintf(`{"channel":"post","data":{"id":%d,"response":{"type":"info","payload":{"type":%q,"data":%s}}}}`, f.ID, q.Type, data))
-		}
-	}
-	gateway := newFakeGateway(t, testVault, false)
-	cfg := tradeConfig(t, ws.URL(), gateway.URL, testVault, OrderTransportWS)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	if err := trade(context.Background(), cfg, logger); err != nil {
-		t.Fatal(err)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(ws.Logins()) != 1 {
-		t.Fatalf("logins = %d", len(ws.Logins()))
-	}
-	want := []string{
-		`subscribe:{"type":"orderUpdates","user":"` + testVault + `"}`,
-		`subscribe:{"type":"userFills","user":"` + testVault + `"}`,
-	}
-	// subscribe, subscribe, action, orderStatus x2 (one per receipt order ID), openOrders
-	if len(frames) != 6 || frames[0] != want[0] || frames[1] != want[1] || !strings.HasPrefix(frames[2], "action:") {
-		t.Fatalf("frames = %v", frames)
-	}
-	for i, f := range frames[3:5] {
-		if !strings.HasPrefix(f, fmt.Sprintf(`info:{"oid":%d,`, 501+i)) || !strings.Contains(f, `"type":"orderStatus"`) {
-			t.Fatalf("reconciliation frame = %s, want orderStatus by receipt order ID over info_json", f)
-		}
-	}
-	if frames[5] != `info:{"type":"openOrders","user":"`+testVault+`"}` {
-		t.Fatalf("last frame = %s, want openOrders over info_json", frames[5])
-	}
-	var req signedPlace
-	if err := json.Unmarshal([]byte(strings.TrimPrefix(frames[2], "action:")), &req); err != nil {
-		t.Fatal(err)
-	}
-	if req.VaultAddress != testVault || len(req.Action.Orders) != 2 || req.Signature.R == "" {
-		t.Fatalf("request = %+v", req)
-	}
-}
-
-// rest mode: no bin-ws connection at all. The signed order is POSTed to
-// /exchange and reconciled with orderStatus and openOrders over POST /info.
-func TestTradeForVaultOverREST(t *testing.T) {
-	ws := binwstest.New(t, "pre-api.riverbit.io")
-	ws.Handle = func(*binwstest.Conn, binws.ClientFrame) { t.Error("rest mode must not send bin-ws frames") }
-	gateway := newFakeGateway(t, testVault, true)
-	cfg := tradeConfig(t, ws.URL(), gateway.URL, testVault, OrderTransportREST)
+	ws.Handle = func(*binwstest.Conn, binws.ClientFrame) { t.Error("trade must not send bin-ws frames") }
+	gateway := newFakeGateway(t, testVault)
+	cfg := tradeConfig(t, ws.URL(), gateway.URL, testVault)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	if err := trade(context.Background(), cfg, logger); err != nil {
 		t.Fatal(err)
 	}
 	if n := len(ws.Logins()); n != 0 {
-		t.Fatalf("rest mode dialed bin-ws (%d logins)", n)
+		t.Fatalf("trade dialed bin-ws (%d logins)", n)
 	}
 	gateway.mu.Lock()
 	defer gateway.mu.Unlock()
@@ -391,12 +268,12 @@ func TestTradeForVaultOverREST(t *testing.T) {
 	}
 }
 
-// rest mode without a vault: the API wallet's master account comes from
+// Without a vault: the API wallet's master account comes from
 // POST /info userRole instead of the bin-ws login.
-func TestTradeForAPIWalletOverRESTResolvesMasterViaUserRole(t *testing.T) {
-	gateway := newFakeGateway(t, testLeader, true)
+func TestTradeForAPIWalletResolvesMasterViaUserRole(t *testing.T) {
+	gateway := newFakeGateway(t, testLeader)
 	// BinWSURL points nowhere: any dial attempt would fail the command.
-	cfg := tradeConfig(t, "ws://127.0.0.1:1/bin-ws", gateway.URL, "", OrderTransportREST)
+	cfg := tradeConfig(t, "ws://127.0.0.1:1/bin-ws", gateway.URL, "")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	if err := trade(context.Background(), cfg, logger); err != nil {
 		t.Fatal(err)

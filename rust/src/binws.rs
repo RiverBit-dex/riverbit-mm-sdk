@@ -2,19 +2,16 @@
 //!
 //! Every message is one Protobuf frame. The first frame on a connection is the
 //! login. A background task owns the socket: it sends pings, matches
-//! `action_json` and `info_json` replies to their requests by outer id, passes
-//! everything else to [`Events`], and, when the connection drops, reconnects,
-//! logs in again and resubscribes.
+//! `info_json` replies to their requests by outer id, passes everything else
+//! to [`Events`], and, when the connection drops, reconnects, logs in again and
+//! resubscribes.
 //!
-//! Requests that were in flight when a connection ended fail. For a signed
-//! action that is an unknown outcome: reconcile, never re-sign.
+//! Queries that were in flight when a connection ended fail; ask again after
+//! [`Event::Reconnected`].
 //!
-//! **Order entry is not available on the public endpoint.** The public
-//! `/bin-ws` endpoint does not accept `action_json`: the server replies
-//! `504 Gateway Timeout`. Send orders, cancellations and modifications over
-//! REST `POST /exchange` (see [`ExchangeClient`](crate::ExchangeClient)). Use
-//! bin-ws for market data, order and fill events and `info_json` queries. The
-//! `action_json` transport below is kept for endpoints that accept it.
+//! bin-ws carries market data, order and fill events and `info_json` queries.
+//! Orders, cancellations and modifications are sent with REST
+//! `POST /exchange` (see [`ExchangeClient`](crate::ExchangeClient)).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -35,7 +32,7 @@ use crate::frames::Frame;
 use crate::proto::{ClientBody, ClientFrame, LoginResult, ServerBody, ServerFrame};
 use crate::signing::{login_message, recover_personal, Address, Signer};
 use crate::subscription::Subscription;
-use crate::transport::{ActionTransport, BoxFuture, InfoTransport, TransportError};
+use crate::transport::{BoxFuture, InfoTransport, TransportError};
 
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -146,10 +143,9 @@ impl Events {
     }
 }
 
-/// Where a posted request is: not yet written, written, or given up on by its
+/// Where a posted query is: not yet written, written, or given up on by its
 /// caller. Whoever moves it out of `QUEUED` first decides: the session task
-/// writes the frame only if it wins, the caller may report "never sent" only
-/// if it wins.
+/// writes the frame only if it wins.
 struct PostState(AtomicU8);
 
 impl PostState {
@@ -174,22 +170,20 @@ impl PostState {
             .is_ok()
     }
 
-    /// The caller gives up. True if the frame had not been claimed for writing:
-    /// it will never be written.
-    fn cancel(&self) -> bool {
-        self.0
-            .compare_exchange(
-                Self::QUEUED,
-                Self::CANCELLED,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok()
+    /// The caller gives up. A frame that had not been claimed for writing is
+    /// never written.
+    fn cancel(&self) {
+        let _ = self.0.compare_exchange(
+            Self::QUEUED,
+            Self::CANCELLED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 }
 
 /// Cancels a queued post when the caller's future is dropped (for example by
-/// an outer timeout), so a request nobody waits for is never written later.
+/// an outer timeout), so a query nobody waits for is never written later.
 struct CancelOnDrop(Arc<PostState>);
 
 impl Drop for CancelOnDrop {
@@ -333,13 +327,13 @@ impl BinWsSession {
             .map_err(|_| Error::Closed("session task ended".into()))?
     }
 
-    async fn post(
-        &self,
-        body: impl FnOnce() -> ClientBody,
-        want: &'static str,
-    ) -> std::result::Result<Box<RawValue>, TransportError> {
+    async fn post(&self, body: &[u8]) -> std::result::Result<Box<RawValue>, TransportError> {
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst) + 1;
-        let frame = ClientFrame { id, body: body() }.encode();
+        let frame = ClientFrame {
+            id,
+            body: ClientBody::InfoJson(body.to_vec()),
+        }
+        .encode();
         let (tx, rx) = oneshot::channel();
         let state = PostState::new();
         // Declared before the send so that every way out of this function,
@@ -355,47 +349,15 @@ impl BinWsSession {
                 reply: tx,
             })
             .await
-            .map_err(|_| TransportError::NotSent("session task ended".into()))?;
+            .map_err(|_| TransportError::SendFailed("session task ended".into()))?;
         let reply = match timeout(self.inner.request_timeout, rx).await {
-            // Still queued: the session task will see the cancellation and
-            // drop the frame, so nothing was or will be written. Otherwise the
-            // frame was written (or is being written) and no reply came.
-            Err(_) if state.cancel() => {
-                return Err(TransportError::NotSent(
-                    "timed out before the request was written".into(),
-                ))
-            }
+            // A frame still queued is dropped by the session task once the
+            // guard cancels it.
             Err(_) => return Err(TransportError::Timeout),
             Ok(Err(_)) => return Err(TransportError::Disconnected("session task ended".into())),
             Ok(Ok(result)) => result?,
         };
-        parse_post_reply(&reply, id, want)
-    }
-}
-
-impl ActionTransport for BinWsSession {
-    /// Sends `body` as `action_json`, byte for byte, and returns the
-    /// exchange's answer from the `post` reply with the same id.
-    ///
-    /// **The public `/bin-ws` endpoint does not accept `action_json`** (the
-    /// server replies `504 Gateway Timeout`, which is an unknown outcome for
-    /// a signed action). Send orders over REST. This transport is for
-    /// endpoints that accept the frame.
-    ///
-    /// If `request_timeout` runs out while the request is still queued, it is
-    /// dropped without ever being written and the error is
-    /// [`TransportError::NotSent`]; once it has been written, running out of
-    /// time is [`TransportError::Timeout`], an unknown outcome.
-    fn post_action<'a>(
-        &'a self,
-        body: &'a [u8],
-    ) -> BoxFuture<'a, std::result::Result<Vec<u8>, TransportError>> {
-        Box::pin(async move {
-            let payload = self
-                .post(|| ClientBody::ActionJson(body.to_vec()), "action")
-                .await?;
-            Ok(payload.get().as_bytes().to_vec())
-        })
+        parse_post_reply(&reply, id)
     }
 }
 
@@ -410,9 +372,7 @@ impl InfoTransport for BinWsSession {
                 .ok()
                 .and_then(|v| v["type"].as_str().map(str::to_string))
                 .ok_or_else(|| TransportError::Other("info query without a type".into()))?;
-            let payload = self
-                .post(|| ClientBody::InfoJson(body.to_vec()), "info")
-                .await?;
+            let payload = self.post(body).await?;
             #[derive(serde::Deserialize)]
             struct Wrapped {
                 #[serde(rename = "type")]
@@ -432,11 +392,10 @@ impl InfoTransport for BinWsSession {
     }
 }
 
-/// `{"channel":"post","data":{"id":N,"response":{"type":"action"|"info"|"error","payload":..}}}`
+/// `{"channel":"post","data":{"id":N,"response":{"type":"info"|"error","payload":..}}}`
 fn parse_post_reply(
     frame: &ServerFrame,
     id: u64,
-    want: &str,
 ) -> std::result::Result<Box<RawValue>, TransportError> {
     #[derive(serde::Deserialize)]
     struct Push {
@@ -478,7 +437,7 @@ fn parse_post_reply(
         )));
     }
     match (push.data.response.kind.as_str(), push.data.response.payload) {
-        (kind, Some(payload)) if kind == want => Ok(payload),
+        ("info", Some(payload)) => Ok(payload),
         ("error", payload) => {
             let text = payload
                 .map(|p| match serde_json::from_str::<String>(p.get()) {
@@ -489,7 +448,7 @@ fn parse_post_reply(
             Err(TransportError::ErrorReply(text))
         }
         (kind, _) => Err(other(format!(
-            "reply to request {id} has response type {kind:?}, want {want:?}"
+            "reply to request {id} has response type {kind:?}, want \"info\""
         ))),
     }
 }
@@ -731,9 +690,8 @@ impl Task {
                 state,
                 reply,
             } => {
-                // The caller may have timed out while this was queued behind
-                // a full event queue. Writing it now would send an order the
-                // caller was told never went out.
+                // The caller may have given up while this was queued behind
+                // a full event queue; nobody waits for the reply any more.
                 if !state.claim_for_write() {
                     return Ok(true);
                 }

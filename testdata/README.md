@@ -74,7 +74,7 @@ A `frames[]` entry:
 | Member | Meaning |
 |---|---|
 | `id` | Outer frame id |
-| `body` | The set member of the `oneof body`: client `action_json`, `info_json`, `subscribe_json`, `unsubscribe_json`, `ping`, `login`; server `json`, `l2_book`, `l2_delta.snapshot`, `l2_delta.update`, `bbo`, `candle`, `trades`, `login` |
+| `body` | The set member of the `oneof body`: client `info_json`, `subscribe_json`, `unsubscribe_json`, `ping`, `login`; server `json`, `l2_book`, `l2_delta.snapshot`, `l2_delta.update`, `bbo`, `candle`, `trades`, `login` |
 | `json` | For the JSON-carrying bodies: the UTF-8 text of the bytes |
 | `message` | For the message-carrying bodies: the decoded message with the field names of [`proto/binws.proto`](../proto/binws.proto). Bytes fields are lowercase hex in members ending in `_hex` (`nonce_hex`, `signature_hex`, `user_hex`, `signer_hex`, `hash_hex`, `buyer_hex`, `seller_hex`). Optional fields that are not set are absent (`bbo` without an ask has no `ask_*`). Repeated fields are arrays, empty when unset |
 | `decimal` | Fixed-point members rendered as exact decimal strings, `value = integer / 10^decimals` with the decimals of the frame (`px_decimals`, `sz_decimals`) |

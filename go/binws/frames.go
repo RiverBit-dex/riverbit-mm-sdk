@@ -11,7 +11,6 @@ import (
 type ClientBody int
 
 const (
-	ClientAction      ClientBody = 2 // bytes action_json: signed /exchange request JSON
 	ClientInfo        ClientBody = 3 // bytes info_json
 	ClientSubscribe   ClientBody = 4 // bytes subscribe_json: the subscription object itself
 	ClientUnsubscribe ClientBody = 5 // bytes unsubscribe_json
@@ -78,7 +77,7 @@ func UnmarshalClientFrame(data []byte) (ClientFrame, error) {
 		return ClientFrame{}, err
 	}
 	found := false
-	for body := ClientAction; body <= ClientLogin; body++ {
+	for body := ClientInfo; body <= ClientLogin; body++ {
 		if !m.has(int(body)) {
 			continue
 		}

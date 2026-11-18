@@ -1,6 +1,6 @@
 # RiverBit Market Maker SDK
 
-Client libraries for market makers integrating with the RiverBit exchange API: market data, order entry, cancellation, modification and reconciliation over REST and the binary WebSocket endpoint (`bin-ws`).
+Client libraries for market makers integrating with the RiverBit exchange API: order entry, cancellation, modification and reconciliation over REST, and market data and order events over the binary WebSocket endpoint (`bin-ws`).
 
 > **Status: pre-release.** Interfaces may change before `v0.1.0`. The SDK contains no quoting strategy; it gives you the protocol, signing and reconciliation building blocks to run your own.
 
@@ -33,7 +33,7 @@ All three implementations follow the same protocol guide, share one Protobuf def
 | REST trading | `https://pre-api.riverbit.io/exchange` |
 | WebSocket (market data, order events, queries) | `wss://pre-api.riverbit.io/bin-ws` |
 
-Orders, cancellations and modifications go through REST `/exchange`; the public WebSocket endpoint carries market data, order and fill events and queries, and does not accept order entry.
+Orders, cancellations and modifications go through REST `/exchange`; the WebSocket endpoint carries market data, order and fill events and queries.
 
 Every client takes the base URL as configuration; nothing is tied to one environment.
 

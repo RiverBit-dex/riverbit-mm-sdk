@@ -104,15 +104,19 @@ func TestClientFrameWireBytes(t *testing.T) {
 	if got := (ClientFrame{Body: ClientPing}).Marshal(); !bytes.Equal(got, []byte{0x32, 0x00}) {
 		t.Fatalf("ping frame = %x, want 3200", got)
 	}
-	action := []byte(`{"action":{}}`)
-	got = ClientFrame{ID: 300, Body: ClientAction, Data: action}.Marshal()
-	want = append([]byte{0x08, 0xac, 0x02, 0x12, byte(len(action))}, action...)
+	info := []byte(`{"type":"meta"}`)
+	got = ClientFrame{ID: 300, Body: ClientInfo, Data: info}.Marshal()
+	want = append([]byte{0x08, 0xac, 0x02, 0x1a, byte(len(info))}, info...)
 	if !bytes.Equal(got, want) {
-		t.Fatalf("action frame = %x, want %x", got, want)
+		t.Fatalf("info frame = %x, want %x", got, want)
 	}
 	back, err := UnmarshalClientFrame(got)
-	if err != nil || back.ID != 300 || back.Body != ClientAction || !bytes.Equal(back.Data, action) {
-		t.Fatalf("action round trip = %+v, %v", back, err)
+	if err != nil || back.ID != 300 || back.Body != ClientInfo || !bytes.Equal(back.Data, info) {
+		t.Fatalf("info round trip = %+v, %v", back, err)
+	}
+	// Field 2 is reserved: a frame carrying it has no known body.
+	if _, err := UnmarshalClientFrame([]byte{0x08, 0x01, 0x12, 0x02, '{', '}'}); err == nil {
+		t.Fatal("frame with only field 2 must fail")
 	}
 	if _, err := UnmarshalClientFrame([]byte{0x08, 0x01}); err == nil {
 		t.Fatal("frame without body must fail")
@@ -317,20 +321,20 @@ func TestParsePostReplyMatchesID(t *testing.T) {
 	reply := func(id uint64, body string) ServerFrame {
 		return ServerFrame{ID: id, Kind: KindJSON, Data: []byte(body)}
 	}
-	payload, err := parsePostReply(reply(5, `{"channel":"post","data":{"id":5,"response":{"type":"action","payload":{"status":"ok"}}}}`), 5, "action")
+	payload, err := parsePostReply(reply(5, `{"channel":"post","data":{"id":5,"response":{"type":"info","payload":{"status":"ok"}}}}`), 5)
 	if err != nil || string(payload) != `{"status":"ok"}` {
 		t.Fatalf("payload = %s, %v", payload, err)
 	}
-	if _, err := parsePostReply(reply(6, `{"channel":"post","data":{"id":6,"response":{"type":"action","payload":{}}}}`), 5, "action"); err == nil {
+	if _, err := parsePostReply(reply(6, `{"channel":"post","data":{"id":6,"response":{"type":"info","payload":{}}}}`), 5); err == nil {
 		t.Fatal("outer id mismatch must fail")
 	}
-	if _, err := parsePostReply(reply(5, `{"channel":"post","data":{"id":4,"response":{"type":"action","payload":{}}}}`), 5, "action"); err == nil {
+	if _, err := parsePostReply(reply(5, `{"channel":"post","data":{"id":4,"response":{"type":"info","payload":{}}}}`), 5); err == nil {
 		t.Fatal("inner id mismatch must fail")
 	}
-	if _, err := parsePostReply(reply(5, `{"channel":"post","data":{"id":5,"response":{"type":"info","payload":{}}}}`), 5, "action"); err == nil {
+	if _, err := parsePostReply(reply(5, `{"channel":"post","data":{"id":5,"response":{"type":"other","payload":{}}}}`), 5); err == nil {
 		t.Fatal("wrong response type must fail")
 	}
-	_, err = parsePostReply(reply(5, `{"channel":"post","data":{"id":5,"response":{"type":"error","payload":"429 Too Many Requests"}}}`), 5, "action")
+	_, err = parsePostReply(reply(5, `{"channel":"post","data":{"id":5,"response":{"type":"error","payload":"429 Too Many Requests"}}}`), 5)
 	var replyErr *PostReplyError
 	if !asPostReplyError(err, &replyErr) || replyErr.Payload != "429 Too Many Requests" {
 		t.Fatalf("error reply = %v", err)

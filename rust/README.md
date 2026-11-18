@@ -33,7 +33,7 @@ Base URL, WebSocket URL and login host are always explicit. The PRE values below
 
 An API wallet signs; the master account (or a vault it leads) is the trading account. The master must authorize the API wallet first. Keep the private key out of source control, command-line arguments, environment variables and logs: read it from a file only your process can read. The SDK never prints key material: `Debug` output of a `Signer` shows only its address, and `Debug` output of a `SignedRequest` shows the action kind, nonce and signer but not the body or the signature.
 
-**Send orders over REST.** The public `/bin-ws` endpoint does not accept `action_json` (the server replies `504 Gateway Timeout`, which for a signed action is an unknown outcome). Order entry, cancellation and modification are `POST /exchange` only; use bin-ws for market data, order and fill events and `info_json` queries.
+**Orders are sent with REST `POST /exchange`:** order entry, cancellation and modification. bin-ws carries market data, order and fill events and `info_json` queries.
 
 ## Quick start
 
@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     session.subscribe(&Subscription::l2("BTC")).await?;
     let mut book = Book::new("BTC");
 
-    // 3. Trade over REST `POST /exchange`: the public bin-ws endpoint does not accept orders.
+    // 3. Trade over REST `POST /exchange`.
     let exchange = ExchangeClient::new(base_url, signer, SigningDomain::new(chain_id))?;
     let order = Order::limit(asset, true, "50000", "0.001", Tif::Alo).with_cloid(Cloid::random()?);
     match exchange.send(&Place::new(vec![order])).await {
@@ -104,7 +104,6 @@ The examples read the key from the file named by `RIVERBIT_KEY_FILE` (for exampl
 | REST `/info` client: `chainIdentity`, `userRole`, `leadingVaults`, `metaAndAssetCtxs`, `l2Book`, `openOrders`, `frontendOpenOrders`, `orderStatus`, `userFills`, `clearinghouseState`, `candleSnapshot`; `Retry-After` honoured on 429 | Yes |
 | REST `/exchange` client with per-leg receipts. Never follows redirects | Yes |
 | bin-ws: connect, login first, subscribe, unsubscribe, ping, id-matched `info_json`, reconnect with login and resubscribe | Yes |
-| bin-ws order entry (`action_json`) | Code kept, **not usable on the public endpoint**: it does not accept `action_json` (`504 Gateway Timeout`). Use REST `/exchange` |
 | Typed frames `l2` delta, `l2Book`, `bbo`, `trades`, `candle`; all other streams as JSON; typed streams that fall back to JSON | Yes |
 | Local order book replaying `l2` snapshots and updates | Yes |
 | Per-leg `statuses[]` parsing; rejected, rate-limited and unknown-outcome errors | Yes |
@@ -123,7 +122,7 @@ The examples read the key from the file named by `RIVERBIT_KEY_FILE` (for exampl
 | `Cloid` | 128-bit client order ID, `0x` plus 32 hex digits |
 | `NonceSource` | Millisecond nonces, strictly increasing; one shared counter per signer in a process |
 | `SignedRequest` | A signed request body, nonce and targets. `ExchangeClient::prepare` creates one; `submit` sends it |
-| `ExchangeClient` | `send(action)`, `prepare`, `submit`. REST `POST /exchange` by default; `for_vault` trades for a vault. A custom `ActionTransport` (including a `BinWsSession`, which the public endpoint does not support for orders) can replace REST |
+| `ExchangeClient` | `send(action)`, `prepare`, `submit`. REST `POST /exchange`; `for_vault` trades for a vault |
 | `InfoClient` | Typed `/info` queries and `query` for any other. Optional routing over bin-ws `info_json` (`with_bin_ws`); `metaAndAssetCtxs`, `userRole` and `leadingVaults` always use REST |
 | `BinWsSession`, `BinWsConfig`, `Events`, `Event` | The connection. `subscribe`, `unsubscribe`, `ping`, `info`, `close`; pushes arrive as `Event::Frame` |
 | `Subscription` | Constructors for `l2`, `l2Book`, `bbo`, `trades`, `candle`, `orderUpdates`, `openOrders`, `userFills`, `clearinghouseState` and `raw` |
@@ -142,7 +141,6 @@ The examples read the key from the file named by `RIVERBIT_KEY_FILE` (for exampl
 | `Rejected` | The exchange refused the whole action and nothing executed (for example code 91, 203, 204 or 1160, or one `PrecisionExceeded` status for a multi-leg action) | Fix the cause, then sign a new request with a new nonce |
 | `RateLimited` | A read was throttled and the retry budget ran out | Wait for `retry_after` |
 | `UnknownOutcome` | The action may or may not have executed: timeout, disconnect, an HTTP error, a redirect or 429 on `/exchange`, an unparseable or ambiguous reply, a duplicate nonce (code 205), `action already pending`, or a receipt whose statuses do not match the submitted legs | Keep it pending and reconcile. **Never re-sign it with a new nonce** |
-| `NotSent` | The request was provably never written (a bin-ws post that timed out while still queued). Nothing executed | The same signed request may be submitted again |
 
 An `UnknownOutcome` carries the signed request: nonce, the exact bytes sent, the oids and cloids the action referred to, the reason and any legs that were observed. Submitting the same `SignedRequest` again is safe (a duplicate nonce cannot execute twice), but the reply to a duplicate does not tell you what the original did. Reconcile instead:
 

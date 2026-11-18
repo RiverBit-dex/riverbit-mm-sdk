@@ -733,8 +733,6 @@ impl TradesFrame {
 /// The body of a `WsV2ClientFrame`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientBody {
-    /// Exact signed action JSON bytes (field 2).
-    ActionJson(Vec<u8>),
     /// Info query JSON (field 3).
     InfoJson(Vec<u8>),
     /// Subscription object JSON (field 4).
@@ -750,7 +748,7 @@ pub enum ClientBody {
 /// `WsV2ClientFrame`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientFrame {
-    /// Request id for action and info bodies; ignored otherwise.
+    /// Request id for info bodies; ignored otherwise.
     pub id: u64,
     /// The body.
     pub body: ClientBody,
@@ -763,7 +761,6 @@ impl ClientFrame {
         let mut out = Vec::new();
         put_varint(&mut out, 1, self.id);
         match &self.body {
-            ClientBody::ActionJson(b) => put_bytes_always(&mut out, 2, b),
             ClientBody::InfoJson(b) => put_bytes_always(&mut out, 3, b),
             ClientBody::SubscribeJson(b) => put_bytes_always(&mut out, 4, b),
             ClientBody::UnsubscribeJson(b) => put_bytes_always(&mut out, 5, b),
@@ -784,7 +781,6 @@ impl ClientFrame {
                     id = want_varint(&wire, "client frame.id")?;
                     continue;
                 }
-                2 => ClientBody::ActionJson(want_bytes(&wire, "action_json")?.to_vec()),
                 3 => ClientBody::InfoJson(want_bytes(&wire, "info_json")?.to_vec()),
                 4 => ClientBody::SubscribeJson(want_bytes(&wire, "subscribe_json")?.to_vec()),
                 5 => ClientBody::UnsubscribeJson(want_bytes(&wire, "unsubscribe_json")?.to_vec()),
@@ -893,10 +889,6 @@ mod tests {
             ClientFrame {
                 id: 0,
                 body: ClientBody::Ping,
-            },
-            ClientFrame {
-                id: 7,
-                body: ClientBody::ActionJson(b"{\"a\":1}".to_vec()),
             },
             ClientFrame {
                 id: 8,

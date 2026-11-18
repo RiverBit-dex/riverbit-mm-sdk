@@ -22,7 +22,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/riverbit-dex/riverbit-mm-sdk/go/binws"
 	"github.com/riverbit-dex/riverbit-mm-sdk/go/exchange"
 )
 
@@ -131,20 +130,12 @@ func readActions(list string) ([]any, error) {
 func parseAction(raw []byte) (any, error) { return exchange.ParseAction(raw) }
 
 // trade submits every action from ACTION_FILE and reconciles each one before
-// the next. ORDER_TRANSPORT picks the path:
-//
-//   - rest (default): signed actions are POSTed to <API_GATEWAY_URL>/exchange
-//     and reconciled over POST /info; bin-ws is never dialed. This is the only
-//     order entry path of the public endpoint.
-//   - ws: one logged-in bin-ws connection carries the order-event
-//     subscriptions, the signed actions (action_json) and the orderStatus /
-//     openOrders reconciliation (info_json), replies matched by frame id. The
-//     public /bin-ws endpoint rejects action_json (504 Gateway Timeout), so
-//     use it only against a gateway that accepts order entry on bin-ws.
+// the next. Signed actions are POSTed to <API_GATEWAY_URL>/exchange and
+// reconciled over POST /info; bin-ws is not used.
 //
 // Startup queries (chainIdentity, vault checks, userRole, metaAndAssetCtxs)
-// use HTTP /info in both modes. Uncertain outcomes are left for
-// reconciliation, never resent.
+// use HTTP /info. Uncertain outcomes are left for reconciliation, never
+// resent.
 func trade(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	return runTrade(ctx, cfg, logger, false)
 }
@@ -152,7 +143,6 @@ func trade(ctx context.Context, cfg Config, logger *slog.Logger) error {
 // recover only observes the journal and current orders. Keeping it separate
 // from trade prevents a restart from accidentally resubmitting ACTION_FILE.
 func runTrade(ctx context.Context, cfg Config, logger *slog.Logger, recoverOnly bool) error {
-	useREST := cfg.OrderTransport == OrderTransportREST
 	var actions []any
 	var err error
 	if !recoverOnly {
@@ -202,20 +192,9 @@ func runTrade(ctx context.Context, cfg Config, logger *slog.Logger, recoverOnly 
 		fmt.Printf("Verified %s asset: index=%d size_decimals=%d max_leverage=%d (from POST /info metaAndAssetCtxs)\n", cfg.Coin, assetIndex, sizeDecimals, maxLeverage)
 	}
 
-	via := "bin-ws (action_json; orderStatus/openOrders via info_json)"
-	if useREST {
-		via = "REST (POST /exchange; orderStatus/openOrders via POST /info)"
-		if err = resolveAccountREST(ctx, client, cfg, logger); err != nil {
-			return err
-		}
-	} else {
-		logger.Warn("ORDER_TRANSPORT=ws: the public bin-ws endpoint does not accept action_json (504 Gateway Timeout); use rest unless your gateway supports order entry on bin-ws")
-		session, err := dialTradeSession(ctx, cfg, client, logger)
-		if err != nil {
-			return err
-		}
-		defer session.Close()
-		client.WS, client.Queries = session, session
+	via := "REST (POST /exchange; orderStatus/openOrders via POST /info)"
+	if err = resolveAccountREST(ctx, client, cfg, logger); err != nil {
+		return err
 	}
 	account := client.AccountAddress()
 	var recoveryErr error
@@ -261,39 +240,8 @@ func runTrade(ctx context.Context, cfg Config, logger *slog.Logger, recoverOnly 
 	return recoveryErr
 }
 
-// dialTradeSession (ws mode only) logs in to bin-ws once, takes the trading
-// account from the login and subscribes to its order events. The session is
-// closed when ctx ends or the caller closes it.
-func dialTradeSession(ctx context.Context, cfg Config, client *exchange.Client, logger *slog.Logger) (*binws.Session, error) {
-	events := &Handler{Log: logger}
-	session, err := binws.Dial(ctx, binws.Config{
-		URL: cfg.BinWSURL, LoginHost: cfg.BinWSLoginHost, Sign: client.Signer(), OnFrame: events.Handle,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("bin-ws login: %w", err)
-	}
-	LogLogin(logger, session)
-	if cfg.GuildVault == "" {
-		// An API wallet trades for the master account the server resolved.
-		if err = client.SetPrincipal(session.User()); err != nil {
-			session.Close()
-			return nil, fmt.Errorf("login user: %w", err)
-		}
-	} else {
-		logger.Info("trading for vault", "vault", cfg.GuildVault, "leader", session.User())
-	}
-	for _, sub := range OrderSubscriptions(client.AccountAddress()) {
-		if err = session.Subscribe(sub); err != nil {
-			session.Close()
-			return nil, fmt.Errorf("subscribe %s: %w", sub.Type, err)
-		}
-	}
-	return session, nil
-}
-
-// resolveAccountREST (rest mode only) finds the account to trade for without
-// bin-ws. A vault target is already fixed and verified. Otherwise HTTP /info
-// userRole says whether the key is an API wallet (role "agent", trading for
+// resolveAccountREST finds the account to trade for. A vault target is already
+// fixed and verified. Otherwise HTTP /info userRole says whether the key is an API wallet (role "agent", trading for
 // data.user) or the master account itself.
 func resolveAccountREST(ctx context.Context, client *exchange.Client, cfg Config, logger *slog.Logger) error {
 	if cfg.GuildVault != "" {

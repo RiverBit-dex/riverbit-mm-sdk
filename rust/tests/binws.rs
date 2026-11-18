@@ -9,16 +9,14 @@ use common::{
     http_server, next_frame, next_seen, ws_server, HttpReply, Seen, WsServer, WsServerOptions,
     TEST_KEY,
 };
-use riverbit_mm_sdk::actions::{Order, Place, Tif};
-use riverbit_mm_sdk::error::UnknownReason;
 use riverbit_mm_sdk::proto::{
     BboFrame, CandleFrame, ClientBody, L2BookFrame, L2DeltaFrame, L2DeltaUpdate, ServerBody,
     ServerFrame, Trade, TradesFrame,
 };
-use riverbit_mm_sdk::signing::{Address, SigningDomain};
+use riverbit_mm_sdk::signing::Address;
 use riverbit_mm_sdk::{
-    BinWsConfig, BinWsSession, Book, Cloid, Error, Event, Events, ExchangeClient, Frame,
-    InfoClient, ReconnectPolicy, Signer, Subscription,
+    BinWsConfig, BinWsSession, Book, Error, Event, Events, Frame, InfoClient, ReconnectPolicy,
+    Signer, Subscription,
 };
 use serde_json::json;
 
@@ -70,14 +68,9 @@ fn post_reply(id: u64, kind: &str, payload: &str) -> String {
     )
 }
 
-fn place_one() -> Place {
-    Place::new(vec![
-        Order::limit(1, true, "80000", "0.001", Tif::Alo).with_cloid(Cloid::from_u128(1))
-    ])
+fn l2_query() -> serde_json::Value {
+    json!({"type": "l2Book", "coin": "BTC"})
 }
-
-const RESTING: &str =
-    r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":777}}]}}}"#;
 
 #[tokio::test]
 async fn login_is_the_first_frame_and_is_verified() {
@@ -365,102 +358,6 @@ async fn replies_are_matched_to_requests_by_id() {
 }
 
 #[tokio::test]
-async fn actions_go_out_as_the_signed_bytes_and_replies_parse_to_receipts() {
-    let mut srv = server().await;
-    let (session, _events) = connect(&srv).await;
-    let conn = srv.conns.recv().await.unwrap();
-    let ex = ExchangeClient::with_transport(
-        Arc::new(session.clone()),
-        signer(),
-        SigningDomain::new(12589),
-    );
-    let request = ex.prepare(&place_one()).unwrap();
-
-    let sending = {
-        let request = request.clone();
-        let ex = Arc::new(ex);
-        tokio::spawn(async move { ex.submit(&request).await })
-    };
-    let (_, frame) = next_frame(&mut srv).await;
-    let ClientBody::ActionJson(bytes) = &frame.body else {
-        panic!("{frame:?}")
-    };
-    assert_eq!(
-        bytes.as_slice(),
-        request.body(),
-        "action_json carries the signed bytes unchanged"
-    );
-    assert_ne!(frame.id, 0);
-    conn.json(frame.id, &post_reply(frame.id, "action", RESTING));
-    let receipt = sending.await.unwrap().unwrap();
-    assert_eq!(receipt.oids(), vec![Some(777)]);
-    assert_eq!(receipt.nonce, request.nonce());
-}
-
-#[tokio::test]
-async fn an_error_reply_to_an_action_is_an_unknown_outcome() {
-    let mut srv = server().await;
-    let (session, _events) = connect(&srv).await;
-    let conn = srv.conns.recv().await.unwrap();
-    let ex = Arc::new(ExchangeClient::with_transport(
-        Arc::new(session),
-        signer(),
-        SigningDomain::new(12589),
-    ));
-    let sending = {
-        let ex = ex.clone();
-        tokio::spawn(async move { ex.send(&place_one()).await })
-    };
-    let (_, frame) = next_frame(&mut srv).await;
-    conn.json(
-        frame.id,
-        &post_reply(frame.id, "error", r#""429 Too Many Requests""#),
-    );
-    let err = sending.await.unwrap().unwrap_err();
-    let unknown = err.as_unknown_outcome().unwrap();
-    assert!(
-        matches!(unknown.reason, UnknownReason::RateLimited { .. }),
-        "{:?}",
-        unknown.reason
-    );
-}
-
-#[tokio::test]
-async fn a_disconnect_during_an_action_is_an_unknown_outcome_with_the_request() {
-    let mut srv = server().await;
-    let (session, mut events) = connect(&srv).await;
-    let conn = srv.conns.recv().await.unwrap();
-    let ex = Arc::new(ExchangeClient::with_transport(
-        Arc::new(session.clone()),
-        signer(),
-        SigningDomain::new(12589),
-    ));
-    let request = ex.prepare(&place_one()).unwrap();
-    let sending = {
-        let ex = ex.clone();
-        let request = request.clone();
-        tokio::spawn(async move { ex.submit(&request).await })
-    };
-    let (_, frame) = next_frame(&mut srv).await;
-    assert!(matches!(frame.body, ClientBody::ActionJson(_)));
-    conn.drop_connection();
-
-    let err = sending.await.unwrap().unwrap_err();
-    let unknown = err.as_unknown_outcome().expect("unknown outcome");
-    assert!(
-        matches!(unknown.reason, UnknownReason::Disconnected(_)),
-        "{:?}",
-        unknown.reason
-    );
-    assert_eq!(unknown.nonce(), request.nonce());
-    assert_eq!(unknown.request.body(), request.body());
-    assert!(matches!(
-        next_event(&mut events).await,
-        Event::Disconnected { .. }
-    ));
-}
-
-#[tokio::test]
 async fn reconnect_logs_in_again_and_resubscribes() {
     let mut srv = server().await;
     let (session, mut events) = connect(&srv).await;
@@ -629,7 +526,7 @@ async fn info_queries_use_bin_ws_except_the_rest_only_types() {
 }
 
 #[tokio::test]
-async fn posting_while_disconnected_fails_fast() {
+async fn a_query_while_disconnected_fails_fast() {
     let mut srv = server().await;
     let mut cfg = config(&srv);
     cfg.reconnect = Some(ReconnectPolicy {
@@ -644,20 +541,35 @@ async fn posting_while_disconnected_fails_fast() {
         next_event(&mut events).await,
         Event::Disconnected { .. }
     ));
-    let ex = ExchangeClient::with_transport(
-        Arc::new(session.clone()),
-        signer(),
-        SigningDomain::new(12589),
-    );
-    let err = ex.send(&place_one()).await.unwrap_err();
+    let err = session.info(&l2_query()).await.unwrap_err();
     assert!(
-        matches!(
-            err.as_unknown_outcome().unwrap().reason,
-            UnknownReason::SendFailed(_)
-        ),
+        matches!(&err, Error::Transport(m) if m.contains("SendFailed")),
         "{err:?}"
     );
     session.close().await;
+}
+
+#[tokio::test]
+async fn a_disconnect_during_a_query_fails_it() {
+    let mut srv = server().await;
+    let (session, mut events) = connect(&srv).await;
+    let conn = srv.conns.recv().await.unwrap();
+    let querying = {
+        let session = session.clone();
+        tokio::spawn(async move { session.info(&l2_query()).await })
+    };
+    let (_, frame) = next_frame(&mut srv).await;
+    assert!(matches!(frame.body, ClientBody::InfoJson(_)));
+    conn.drop_connection();
+    let err = querying.await.unwrap().unwrap_err();
+    assert!(
+        matches!(&err, Error::Transport(m) if m.contains("Disconnected")),
+        "{err:?}"
+    );
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::Disconnected { .. }
+    ));
 }
 
 const PUSH: &str = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe"}}"#;
@@ -682,85 +594,63 @@ async fn stalled_session(
 }
 
 /// Drains the events so the session task can run again, then reports whether
-/// the server ever received an `action_json` frame.
-async fn action_reached_server(srv: &mut WsServer, events: &mut Events) -> bool {
+/// the server ever received an `info_json` frame.
+async fn query_reached_server(srv: &mut WsServer, events: &mut Events) -> bool {
     while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(300), events.next()).await {}
-    let mut seen_action = false;
+    let mut seen_query = false;
     while let Ok((_, seen)) = tokio::time::timeout(Duration::from_millis(300), srv.seen.recv())
         .await
         .map(|s| s.expect("server closed"))
     {
         if let Seen::Frame(f) = seen {
-            seen_action |= matches!(f.body, ClientBody::ActionJson(_));
+            seen_query |= matches!(f.body, ClientBody::InfoJson(_));
         }
     }
-    seen_action
+    seen_query
 }
 
 #[tokio::test]
-async fn a_post_that_timed_out_while_queued_is_never_written() {
+async fn a_query_that_timed_out_while_queued_is_never_written() {
     let (mut srv, session, mut events, _conn) = stalled_session(Duration::from_millis(300)).await;
-    let ex = ExchangeClient::with_transport(
-        Arc::new(session.clone()),
-        signer(),
-        SigningDomain::new(12589),
-    );
-    let request = ex.prepare(&place_one()).unwrap();
-    let err = ex.submit(&request).await.unwrap_err();
-    match &err {
-        Error::NotSent { request: r, .. } => assert_eq!(r.body(), request.body()),
-        other => panic!("not provably unsent: {other:?}"),
-    }
-    assert!(!err.is_unknown_outcome());
+    let err = session.info(&l2_query()).await.unwrap_err();
     assert!(
-        !action_reached_server(&mut srv, &mut events).await,
-        "a post whose caller gave up must not be written"
+        matches!(&err, Error::Transport(m) if m.contains("Timeout")),
+        "{err:?}"
+    );
+    assert!(
+        !query_reached_server(&mut srv, &mut events).await,
+        "a query whose caller gave up must not be written"
     );
     session.close().await;
 }
 
 #[tokio::test]
-async fn a_post_dropped_by_an_outer_timeout_is_never_written() {
-    // The client's own timeout is shorter than the session's: the future is
-    // dropped while the post is still queued. That is reported as an unknown
-    // outcome (the client cannot tell), but the order must not go out later.
+async fn a_query_dropped_by_an_outer_timeout_is_never_written() {
+    // The caller's own timeout is shorter than the session's: the future is
+    // dropped while the query is still queued, and it must not go out later.
     let (mut srv, session, mut events, _conn) = stalled_session(Duration::from_secs(20)).await;
-    let ex = ExchangeClient::with_transport(
-        Arc::new(session.clone()),
-        signer(),
-        SigningDomain::new(12589),
-    )
-    .with_timeout(Duration::from_millis(300));
-    let err = ex.send(&place_one()).await.unwrap_err();
-    assert_eq!(
-        err.as_unknown_outcome().expect("unknown outcome").reason,
-        UnknownReason::Timeout
-    );
+    let outcome = tokio::time::timeout(Duration::from_millis(300), session.info(&l2_query())).await;
+    assert!(outcome.is_err(), "the outer timeout fires first");
     assert!(
-        !action_reached_server(&mut srv, &mut events).await,
-        "a post whose caller gave up must not be written"
+        !query_reached_server(&mut srv, &mut events).await,
+        "a query whose caller gave up must not be written"
     );
     session.close().await;
 }
 
 #[tokio::test]
-async fn a_written_post_without_a_reply_is_an_unknown_outcome() {
+async fn a_written_query_without_a_reply_times_out() {
     let mut srv = server().await;
     let mut cfg = config(&srv);
     cfg.request_timeout = Duration::from_millis(300);
     let (session, _events) = BinWsSession::connect(cfg).await.unwrap();
     let _conn = srv.conns.recv().await.unwrap();
-    let ex = ExchangeClient::with_transport(
-        Arc::new(session.clone()),
-        signer(),
-        SigningDomain::new(12589),
-    );
-    let err = ex.send(&place_one()).await.unwrap_err();
-    assert_eq!(
-        err.as_unknown_outcome().expect("unknown outcome").reason,
-        UnknownReason::Timeout
+    let err = session.info(&l2_query()).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Transport(m) if m.contains("Timeout")),
+        "{err:?}"
     );
     let (_, frame) = next_frame(&mut srv).await;
-    assert!(matches!(frame.body, ClientBody::ActionJson(_)));
+    assert!(matches!(frame.body, ClientBody::InfoJson(_)));
     session.close().await;
 }

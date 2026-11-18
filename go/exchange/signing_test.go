@@ -2,13 +2,10 @@ package exchange
 
 import (
 	"bytes"
-	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -16,7 +13,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/riverbit-dex/riverbit-mm-sdk/go/binws"
-	"github.com/riverbit-dex/riverbit-mm-sdk/go/binws/binwstest"
 )
 
 const testVault = "0x0102030405060708090a0b0c0d0e0f1011121314"
@@ -78,72 +74,11 @@ func TestPersonalSignRecoversSigner(t *testing.T) {
 	}
 }
 
-// fakeExchange is a bin-ws endpoint plus an HTTP /info for orderStatus reconciliation.
+// fakeExchange verifies signed /exchange request bodies for fake gateways.
 type fakeExchange struct {
 	t        *testing.T
-	ws       *binwstest.Server
-	info     *httptest.Server
 	mu       sync.Mutex
-	requests []json.RawMessage // action_json bodies received
-	canceled map[string]bool   // cloids reported canceled
-	book     cloidBook
-}
-
-func newFakeExchange(t *testing.T, client *Client) *fakeExchange {
-	f := &fakeExchange{t: t, canceled: map[string]bool{}}
-	f.ws = binwstest.New(t, "pre-api.riverbit.io")
-	f.ws.User = "0x9999999999999999999999999999999999999999"
-	f.ws.Handle = func(c *binwstest.Conn, frame binws.ClientFrame) {
-		if frame.Body != binws.ClientAction {
-			return
-		}
-		if frame.ID == 0 {
-			t.Errorf("action frame without id")
-		}
-		f.mu.Lock()
-		f.requests = append(f.requests, append(json.RawMessage(nil), frame.Data...))
-		f.mu.Unlock()
-		f.book.record(frame.Data)
-		payload := f.verify(client, frame.Data)
-		_ = c.SendJSON(0, `{"channel":"orderUpdates","data":[]}`) // a push before the reply
-		_ = c.SendJSON(frame.ID, fmt.Sprintf(`{"channel":"post","data":{"id":%d,"response":{"type":"action","payload":%s}}}`, frame.ID, payload))
-	}
-	f.info = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var q struct {
-			Type string `json:"type"`
-			User string `json:"user"`
-			OID  any    `json:"oid"`
-		}
-		if r.URL.Path != "/info" || json.NewDecoder(r.Body).Decode(&q) != nil || q.Type != "orderStatus" {
-			t.Errorf("unexpected HTTP request %s", r.URL.Path)
-			return
-		}
-		if q.User != testVault {
-			t.Errorf("orderStatus user = %s, want the vault", q.User)
-		}
-		status := "open"
-		orderID := uint64(4242)
-		switch oid := q.OID.(type) {
-		case float64:
-			status = "canceled" // cancel / modify targets by oid
-			orderID = uint64(oid)
-		case string:
-			f.mu.Lock()
-			if f.canceled[oid] {
-				status = "canceled"
-			}
-			f.mu.Unlock()
-		}
-		if cloid, ok := q.OID.(string); ok {
-			if o, known := f.book.get(cloid); known {
-				fmt.Fprint(w, orderStatusBody(7, status, orderID, o))
-				return
-			}
-		}
-		fmt.Fprintf(w, `{"height":7,"status":"order","order":{"status":%q,"order":{"coin":"RBT","oid":%d}}}`, status, orderID)
-	}))
-	t.Cleanup(f.info.Close)
-	return f
+	canceled map[string]bool // cloids reported canceled
 }
 
 // verify checks the wire shape and the vault-bound signature, then returns the node payload.
@@ -237,79 +172,6 @@ func topLevelKeys(body []byte) ([]string, error) {
 		}
 	}
 	return keys, nil
-}
-
-func TestVaultActionsOverOneBinWSSession(t *testing.T) {
-	client, err := newTestVaultClient("http://placeholder", testVault)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.SignChainID = 12589
-	client.StateDir = t.TempDir()
-	fake := newFakeExchange(t, client)
-	client.URL = fake.info.URL
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	session, err := binws.Dial(ctx, binws.Config{URL: fake.ws.URL(), LoginHost: "pre-api.riverbit.io", Sign: client.Signer()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
-	client.WS = session
-
-	var cloid Cloid
-	if err := json.Unmarshal([]byte(`"0x1234567890abcdef1234567890abcdef"`), &cloid); err != nil {
-		t.Fatal(err)
-	}
-	order := Order{Asset: 0, Buy: true, Price: "100.0000", Size: "0.10", Type: OrderType{Limit: Limit{TIF: "Alo"}}}
-	actions := []any{
-		&Place{Type: "order", Orders: []Order{order, {Asset: 0, Price: "110.0000", Size: "0.10", Type: OrderType{Limit: Limit{TIF: "Alo"}}}}, Grouping: "na"},
-		&Cancel{Type: "cancel", Cancels: []CancelItem{{Asset: 0, OID: 4242}}},
-		&CancelByCloid{Type: "cancelByCloid", Cancels: []CancelByCloidItem{{Asset: 0, Cloid: cloid}}},
-		&Modify{Type: "modify", OID: 4243, Order: order},
-		&BatchModify{Type: "batchModify", Modifies: []ModifyItem{{OID: 4244, Order: order}, {OID: 4245, Order: order}}},
-	}
-	for _, action := range actions {
-		if err := client.Exchange(ctx, action); err != nil {
-			t.Fatalf("%T over bin-ws: %v", action, err)
-		}
-	}
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	if len(fake.requests) != len(actions) {
-		t.Fatalf("server saw %d actions, want %d", len(fake.requests), len(actions))
-	}
-	if logins := fake.ws.Logins(); len(logins) != 1 {
-		t.Fatalf("one long-lived connection expected, saw %d logins", len(logins))
-	}
-}
-
-func TestBinWSErrorReplyIsNotARejection(t *testing.T) {
-	client, err := newTestClient("http://placeholder")
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.SignChainID = 12589
-	server := binwstest.New(t, "h")
-	server.Handle = func(c *binwstest.Conn, f binws.ClientFrame) {
-		_ = c.SendJSON(f.ID, fmt.Sprintf(`{"channel":"post","data":{"id":%d,"response":{"type":"error","payload":"429 Too Many Requests"}}}`, f.ID))
-	}
-	session, err := binws.Dial(context.Background(), binws.Config{URL: server.URL(), LoginHost: "h", Sign: client.Signer()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
-	client.WS = session
-	err = client.Exchange(context.Background(), &Cancel{Type: "cancel", Cancels: []CancelItem{{Asset: 0, OID: 1}}})
-	var rej *ActionRejectedError
-	var unknown *UnknownOutcomeError
-	if err == nil || !strings.Contains(err.Error(), "429 Too Many Requests") || errorsAs(err, &rej) || !errors.As(err, &unknown) {
-		t.Fatalf("error = %v; want an unknown outcome, not a final rejection", err)
-	}
-	if unknown.Nonce == 0 || len(unknown.Action) == 0 {
-		t.Fatalf("unknown outcome lacks the nonce or the signed action: %+v", unknown)
-	}
 }
 
 var testNow = time.UnixMilli(1760000000000)

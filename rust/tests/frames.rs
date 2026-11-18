@@ -39,7 +39,6 @@ fn describe_client(
     frame: &ClientFrame,
 ) -> (&'static str, Option<String>, Option<Value>, Option<Value>) {
     match &frame.body {
-        ClientBody::ActionJson(b) => ("action_json", Some(text(b)), None, None),
         ClientBody::InfoJson(b) => ("info_json", Some(text(b)), None, None),
         ClientBody::SubscribeJson(b) => ("subscribe_json", Some(text(b)), None, None),
         ClientBody::UnsubscribeJson(b) => ("unsubscribe_json", Some(text(b)), None, None),

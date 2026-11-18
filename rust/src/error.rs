@@ -1,6 +1,6 @@
 //! Error types.
 //!
-//! The three outcomes of a write are kept apart on purpose:
+//! The outcomes of a write are kept apart on purpose:
 //!
 //! * [`Error::Rejected`]: the exchange explicitly refused the action and
 //!   nothing executed. The request is final; fix the cause and, only then,
@@ -9,9 +9,6 @@
 //! * [`Error::UnknownOutcome`]: the action may or may not have executed.
 //!   It carries the nonce and the exact signed bytes. Reconcile it; **never**
 //!   sign the same intent again with a new nonce.
-//! * [`Error::NotSent`]: the request was provably never written (for example a
-//!   bin-ws post whose caller timed out while it was still queued). Nothing
-//!   executed; the same signed request may be submitted again.
 
 use std::fmt;
 use std::time::Duration;
@@ -29,7 +26,7 @@ pub enum Error {
     #[error("action rejected: {0}")]
     Rejected(Box<Rejected>),
 
-    /// The server answered 429 (or the bin-ws equivalent) and retries ran out.
+    /// The server answered 429 and retries ran out.
     #[error("rate limited{}", fmt_retry_after(.retry_after))]
     RateLimited {
         /// The `Retry-After` the server asked for, if it sent one.
@@ -39,17 +36,6 @@ pub enum Error {
     /// A write whose outcome is not known. Keep it pending and reconcile.
     #[error("outcome unknown ({}); reconcile nonce {} instead of resending", .0.reason, .0.request.nonce())]
     UnknownOutcome(Box<UnknownOutcome>),
-
-    /// A signed request that was provably never written to the connection:
-    /// it timed out while still queued. Nothing executed, so submitting the
-    /// same request again is safe and no reconciliation is needed.
-    #[error("request not sent ({reason}); nonce {} may be submitted again", .request.nonce())]
-    NotSent {
-        /// The signed request, unchanged.
-        request: Box<SignedRequest>,
-        /// Why it was not sent.
-        reason: String,
-    },
 
     /// The caller supplied something that cannot be sent.
     #[error("invalid input: {0}")]
@@ -157,8 +143,6 @@ pub enum UnknownReason {
         /// The `Retry-After` the server asked for, if it sent one.
         retry_after: Option<Duration>,
     },
-    /// An error reply on bin-ws.
-    ErrorReply(String),
     /// The reply was not valid JSON or not shaped like an exchange reply.
     MalformedReply,
     /// The reply is valid but does not prove a final outcome: mixed or
@@ -176,7 +160,6 @@ impl fmt::Display for UnknownReason {
             UnknownReason::SendFailed(m) => write!(f, "send failed: {m}"),
             UnknownReason::HttpStatus(s) => write!(f, "HTTP {s}"),
             UnknownReason::RateLimited { .. } => f.write_str("HTTP 429"),
-            UnknownReason::ErrorReply(m) => write!(f, "error reply: {m}"),
             UnknownReason::MalformedReply => f.write_str("malformed reply"),
             UnknownReason::AmbiguousReceipt => f.write_str("ambiguous receipt"),
         }

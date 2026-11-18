@@ -26,8 +26,8 @@ const SigningSource = "b"
 var ErrNoChainID = errors.New("SignChainID is not set: query chainIdentity and set Client.SignChainID (see Client.LoadChainID)")
 
 // Client signs and submits trading actions for one signer and one account (the
-// master account, or a vault the master leads), over REST or an authenticated
-// bin-ws session, and reconciles every request whose outcome is unknown.
+// master account, or a vault the master leads), over REST POST /exchange, and
+// reconciles every request whose outcome is unknown.
 //
 // Set the exported fields after construction and before the first call. A
 // Client is safe for use by several goroutines; submissions of one signer are
@@ -40,16 +40,6 @@ type Client struct {
 	// timeout. Whatever client is set here, the SDK never follows a redirect for
 	// a request it sends: a 3xx answer to POST /exchange is an unknown outcome.
 	HTTP *http.Client
-	// WS, when set, carries signed actions over a logged-in bin-ws session
-	// (action_json) instead of POST <URL>/exchange. Both paths send the same
-	// signed bytes. *binws.Session implements ActionTransport.
-	//
-	// The public RiverBit /bin-ws endpoint does not accept action_json: it
-	// answers 504 Gateway Timeout, which is an unknown outcome here. Leave WS
-	// nil to submit orders over REST POST /exchange, which is the supported
-	// path; use bin-ws for market data, order and fill events and Queries.
-	// WS exists for gateways that do accept order entry on bin-ws.
-	WS ActionTransport
 	// Queries, when set, carries the reconciliation queries (orderStatus,
 	// openOrders) over bin-ws info_json instead of POST <URL>/info. Startup
 	// queries (chainIdentity, metaAndAssetCtxs, userRole, vault checks) always
@@ -364,7 +354,7 @@ type requestEnvelope struct {
 }
 
 // SignedRequest signs action with nonce and returns the complete request body:
-// the exact bytes to POST to /exchange or to send as bin-ws action_json. The
+// the exact bytes to POST to /exchange. The
 // same restriction as Sign applies: the action must be an SDK action type.
 func (c *Client) SignedRequest(action any, nonce uint64) ([]byte, error) {
 	sig, err := c.Sign(action, nonce)
@@ -560,19 +550,14 @@ func (c *Client) submit(ctx context.Context, action any, n uint64, s Signature) 
 		Response        json.RawMessage `json:"response"`
 		CommittedResult json.RawMessage `json:"committedResult"`
 	}
-	// One serialization for both transports: REST POST /exchange and bin-ws
-	// action_json carry exactly these bytes (struct order = signing key order).
+	// One serialization: the bytes POSTed to /exchange are exactly these
+	// (struct order = signing key order).
 	body, err := json.Marshal(requestEnvelope{action, n, s, c.account})
 	if err != nil {
 		return err
 	}
 	var reply json.RawMessage
-	if c.WS != nil {
-		err = c.postBinary(ctx, body, &reply)
-	} else {
-		err = c.postREST(ctx, body, &reply)
-	}
-	if err != nil {
+	if err = c.postREST(ctx, body, &reply); err != nil {
 		return c.unknown(action, n, err)
 	}
 	if err = json.Unmarshal(reply, &result); err != nil {

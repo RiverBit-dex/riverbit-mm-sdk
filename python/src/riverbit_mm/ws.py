@@ -31,7 +31,7 @@ from .errors import (
     RequestTimeout,
     SessionClosed,
 )
-from .signing import SignedRequest, Signer, recover_login_signer
+from .signing import Signer, recover_login_signer
 
 log = logging.getLogger("riverbit_mm.ws")
 
@@ -441,18 +441,6 @@ class BinWsSession:
             self._pending.pop(request_id, None)
         return _parse_post_reply(reply, request_id, want)
 
-    async def post_action(
-        self, request: bytes | SignedRequest, *, timeout: float | None = None
-    ) -> Any:
-        """Send a signed request body as ``action_json`` and return the node's answer.
-
-        The bytes go out unchanged. :class:`NotConnected` means nothing was written;
-        :class:`SessionClosed`, :class:`RequestTimeout` and :class:`PostError` leave the
-        outcome unknown (the :class:`~riverbit_mm.ExchangeClient` converts them).
-        """
-        body = request.body if isinstance(request, SignedRequest) else request
-        return await self._post(fr.CLIENT_ACTION, body, "action", timeout)
-
     async def post_info(self, query: Mapping[str, Any], *, timeout: float | None = None) -> Any:
         """Send ``info_json``; returns the reply payload ``{"type":..,"data":..}``.
 
@@ -485,7 +473,7 @@ class BinWsSession:
 
 
 def _parse_post_reply(frame: fr.ServerFrame, request_id: int, want: str) -> Any:
-    """``{"channel":"post","data":{"id":N,"response":{"type":"action"|"info"|"error","payload":..}}}``"""
+    """``{"channel":"post","data":{"id":N,"response":{"type":"info"|"error","payload":..}}}``"""
     body = frame.body
     if not isinstance(body, fr.JsonFrame):
         raise ProtocolError(f"reply to request {request_id} is not a JSON frame")

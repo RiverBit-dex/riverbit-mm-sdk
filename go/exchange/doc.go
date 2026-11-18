@@ -9,9 +9,8 @@
 //     signing key order. Prices and sizes are decimal strings.
 //   - InfoClient: unsigned REST /info queries (chain identity, asset metadata,
 //     user role, open orders, ...) with Retry-After handling.
-//   - Client: signs actions (EIP-712), sends them over REST /exchange (the
-//     order entry path of the public endpoint; its /bin-ws rejects action_json)
-//     or, where a gateway accepts it, over a bin-ws Session, parses receipts, and keeps a durable pending journal so
+//   - Client: signs actions (EIP-712), sends them over REST POST /exchange,
+//     parses receipts, and keeps a durable pending journal so
 //     that a request with an unknown outcome is reconciled by order ID or client
 //     order ID after a timeout, a disconnect or a restart, never re-signed.
 //   - Errors: *ActionRejectedError (the whole action was refused, final),

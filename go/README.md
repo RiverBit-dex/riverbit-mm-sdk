@@ -75,9 +75,8 @@ func main() {
 	defer session.Close()
 	_ = session.Subscribe(binws.L2("BTC"))
 
-	// The trading client. Orders go out as REST POST /exchange: the public
-	// /bin-ws endpoint does not accept action_json (it answers 504 Gateway
-	// Timeout), so leave client.WS nil. StateDir turns on the durable pending journal.
+	// The trading client. Orders go out as REST POST /exchange. StateDir turns
+	// on the durable pending journal.
 	client, err := exchange.New(restURL, signer)
 	if err != nil {
 		log.Fatal(err)
@@ -114,7 +113,7 @@ func main() {
 }
 ```
 
-Order entry is REST `POST /exchange`. The public `/bin-ws` endpoint does not accept `action_json` (the server replies `504 Gateway Timeout`); use bin-ws for market data, order and fill events, and `info_json` queries. `Client.WS` sends signed actions as `action_json` for gateways that do accept it; it is not for the public endpoint, and an error reply to an action is always an unknown outcome, never a rejection.
+Orders, cancellations and modifications are submitted with REST `POST /exchange`. bin-ws carries market data, order and fill events, and `info_json` queries.
 
 ## Capabilities
 
@@ -124,8 +123,8 @@ Order entry is REST `POST /exchange`. The public `/bin-ws` endpoint does not acc
 | bin-ws login signing (EIP-191) | `exchange.Signer.PersonalSign`, `binws.NewLogin` | `binws.Signer` is an interface, so a remote or hardware key can sign |
 | Actions: `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify` | `exchange.Place`, `Cancel`, `CancelByCloid`, `Modify`, `BatchModify`; `NewPlace`, `LimitOrder`, ... | Prices and sizes are decimal strings end to end. `exchange.Cloid` is a 128-bit client order ID |
 | REST `/info` | `exchange.InfoClient` | `Query` for any type; typed helpers for `chainIdentity`, `metaAndAssetCtxs`, `userRole`, `openOrders`. 429 is retried: it waits for `Retry-After` when present, otherwise capped exponential backoff |
-| REST `/exchange` | `exchange.Client` | The order entry path of the public endpoint. Redirects are never followed: a 3xx answer is an unknown outcome |
-| bin-ws session | `binws.Dial`, `Session` | First-frame login, subscribe/unsubscribe, ping, `action_json` and `info_json` requests matched by frame id (the public endpoint rejects `action_json`; see above) |
+| REST `/exchange` | `exchange.Client` | Orders, cancellations and modifications. Redirects are never followed: a 3xx answer is an unknown outcome |
+| bin-ws session | `binws.Dial`, `Session` | First-frame login, subscribe/unsubscribe, ping, `info_json` requests matched by frame id |
 | Reconnect | `binws.Run` | Reconnect, log in again, resubscribe, with backoff |
 | Typed frames | `binws.Router` | `l2`, `l2Book`, `bbo`, `trades`, `candle`; other streams arrive as JSON; the JSON fallbacks of typed streams are handled |
 | Local order book | `binws.Book` | Replays `l2` snapshots and updates (typed and JSON), exact `big.Rat` levels |
@@ -143,7 +142,7 @@ Not included: quoting or risk logic, automatic cancellation on shutdown, a cross
 - `exchange.NewSigner(hexKey)` loads a key. `exchange.New(url, signer)` trades for the signer's own account; `NewForVault(url, signer, vault)` for a vault; `SetPrincipal(master)` records the master an API wallet acts for. Call `VerifySubAccount` before trading for a vault.
 - Set `SignChainID` through `Client.LoadChainID`; there is no default, and a wrong value gives code 91.
 - `Client.Exchange(ctx, action)` signs, sends and reconciles. `LastOrderIDs`, `LastStatuses` and `LastReceipt` describe the last request. `RecoverPending(ctx)` only observes: it queries and never submits.
-- Orders are submitted over REST by default. Set `Client.Queries` to a `*binws.Session` to run the reconciliation queries over bin-ws `info_json`. `Client.WS` sends actions over bin-ws `action_json`, which the public endpoint rejects (`504 Gateway Timeout`); leave it nil there.
+- Orders are submitted over REST `POST /exchange`. Set `Client.Queries` to a `*binws.Session` to run the reconciliation queries over bin-ws `info_json`; otherwise they use REST `/info`.
 - Use `exchange.NewCloid()` for a fresh client order ID per order. A cloid must not be reused while any earlier request with it is unresolved: recovery accepts an order found by cloid only if it was created after the request was journaled and has the submitted side, price and size, and otherwise keeps the request pending. When the reply carried a receipt, recovery follows the order IDs in it instead.
 - `binws.Config.OnFrame` receives pushes; `Router.Handle` is a ready callback. `Config.Sign` takes an `exchange.Signer`.
 - Errors: `errors.As` into `*exchange.UnknownOutcomeError` to get the nonce, account, signed action and cloids to reconcile; `errors.Is(err, exchange.ErrExecutionRejected)` for a final rejection in which no leg executed; `errors.As` into `*exchange.PartialExecutionError` for a request in which some legs executed (`Executed`), some were rejected (`Rejected`) and some wait (`Tracking`). Partial success is not rolled back: never resend the whole request.
@@ -169,10 +168,9 @@ KEY_FILE=./key go run ./examples/mmcli recover
 |---|---|---|
 | `BIN_WS_URL` | `wss://pre-api.riverbit.io/bin-ws` | bin-ws endpoint |
 | `BIN_WS_LOGIN_HOST` | `pre-api.riverbit.io` | `host:` line of the login message; must equal the server's public host |
-| `API_GATEWAY_URL` | `https://pre-api.riverbit.io` | REST base URL |
+| `API_GATEWAY_URL` | `https://pre-api.riverbit.io` | REST base URL (`/exchange` for orders, `/info` for queries) |
 | `COIN` | `BTC` | market to watch and trade |
 | `BOOK_STREAM` | `l2` | `l2` (incremental) or `l2Book` (snapshots) |
-| `ORDER_TRANSPORT` | `rest` | `rest` (`POST /exchange`) or `ws` (bin-ws `action_json`; the public endpoint rejects it with `504 Gateway Timeout`, use it only against a gateway that accepts order entry on bin-ws) |
 | `GUILD_VAULT_ADDRESS` | empty | trade for this vault; the signer must lead it or be its API wallet |
 | `KEY_FILE` | `key` | file with the private key |
 | `STATE_DIR` | `state` | durable pending journal directory |

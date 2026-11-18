@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-// The HTTP response or WS request ID binds this receipt to the submitted
+// The HTTP response binds this receipt to the submitted
 // batch. Persist it before querying the independently lagging order projection.
 type batchReceipt struct{ Raw json.RawMessage }
 
